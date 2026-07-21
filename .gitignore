@@ -1,0 +1,22 @@
+# Entorno virtual (se recrea con requirements.txt)
+venv/
+
+# Cache de Python
+__pycache__/
+*.pyc
+
+# Config local de Claude Code (no es parte del proyecto)
+.claude/
+
+# Resultados de clasificacion: contienen datos reales de contactos
+resultados_*/
+prueba_rapida/
+buenos.xlsx
+revisar.xlsx
+eliminar.xlsx
+malos.xlsx
+
+# Archivos de entrada/lotes con datos reales de contactos (CSV/Excel)
+*.csv
+*.xlsx
+*.xls

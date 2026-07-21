@@ -1,0 +1,7 @@
+pandas
+openpyxl
+dnspython
+tqdm
+disposable-email-domains
+email-validator
+streamlit

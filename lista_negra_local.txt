@@ -1,0 +1,14 @@
+# Lista negra local de dominios desechables/temporales
+# ------------------------------------------------------
+# Añade aquí (uno por línea) dominios que detectéis como
+# desechables y que la librería 'disposable-email-domains'
+# todavía no incluya. No hace falta tocar el código.
+#
+# Reglas:
+#   - Una línea = un dominio (sin @, solo la parte de after '@')
+#   - Las líneas que empiezan por '#' se ignoran (comentarios)
+#   - No hace falta orden alfabético ni mayúsculas/minúsculas
+#
+# Ejemplo:
+# mailinator-clone.com
+# tempcorreo24.net
