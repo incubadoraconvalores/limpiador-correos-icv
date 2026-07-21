@@ -20,7 +20,10 @@ puede conectarse por SMTP, o usá el checkbox "Desactivar verificación
 SMTP" de acá abajo si necesitás igual filtrar por sintaxis/dominio/desechables.
 """
 
+import smtplib
 import threading
+import time
+import urllib.request
 
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
@@ -30,6 +33,8 @@ from limpiador_correos_fase1 import (
     CONCURRENCIA_POR_DOMINIO_DEFAULT,
     DNS_TIMEOUT_DEFAULT,
     RUTA_LISTA_NEGRA_LOCAL,
+    SMTP_HELO_DOMINIO,
+    SMTP_MAIL_FROM,
     SMTP_TIMEOUT_DEFAULT,
     SMTP_TIMEOUT_PROVEEDOR_MASIVO_DEFAULT,
     cargar_o_crear_lista_negra_local,
@@ -38,6 +43,7 @@ from limpiador_correos_fase1 import (
     generar_excel_en_memoria,
     leer_lista_contactos,
     particionar_por_accion,
+    verificar_mx,
 )
 
 st.set_page_config(page_title="Limpiador de correos - Fase 1", page_icon="📧")
@@ -47,6 +53,135 @@ st.caption(
     "Subí tu lista de contactos, verificamos cada correo (sintaxis, dominio, "
     "desechables y SMTP) y descargá los resultados separados en 3 archivos."
 )
+
+# ==========================================================================
+# BLOQUE TEMPORAL DE DIAGNOSTICO -- SACAR DESPUES DE USAR
+# ==========================================================================
+# Objetivo: comparar el comportamiento de red de ESTE entorno (Streamlit
+# Cloud) contra el de una red local, para explicar por que un mismo archivo
+# da MANTENER muy distinto en cada uno. No toca clasificar_email() ni
+# ninguna logica de clasificacion real -- hace su propia conversacion SMTP
+# cruda (HELO/MAIL FROM/RCPT TO) por fuera del pipeline, solo para mostrar
+# el codigo y mensaje TAL CUAL los devuelve el servidor, tanto para una
+# direccion real como para una inventada en el mismo dominio.
+#
+# Interpretacion:
+#   - Real=250, Inventada=algo distinto de 250 -> el servidor SI esta
+#     verificando el buzon de verdad. El MANTENER de este entorno es confiable
+#     para ese dominio.
+#   - Real=250 e Inventada=250 -> o el dominio es catch-all (acepta
+#     cualquier direccion), o algo en la red de este entorno esta aceptando
+#     el RCPT TO sin llegar a verificar contra el buzon real.
+def _diagnostico_rcpt_crudo(email: str, mx_host: str, timeout: float):
+    smtp = None
+    try:
+        smtp = smtplib.SMTP(timeout=timeout)
+        smtp.connect(mx_host, 25)
+        smtp.helo(SMTP_HELO_DOMINIO)
+        smtp.mail(SMTP_MAIL_FROM)
+        codigo, mensaje = smtp.rcpt(email)
+        mensaje_texto = mensaje.decode("utf-8", errors="ignore") if isinstance(mensaje, bytes) else str(mensaje)
+        return codigo, mensaje_texto, None
+    except Exception as e:
+        return None, None, repr(e)
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+
+
+def _obtener_ip_publica_saliente():
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+with st.expander("🔧 Diagnóstico temporal de red SMTP (sacar este bloque después de usar)"):
+    st.caption(
+        "Prueba, dominio por dominio, una dirección real (opcional) y una "
+        "dirección INVENTADA en el mismo dominio, mostrando el código y "
+        "mensaje SMTP crudos que devuelve el servidor -- sin pasar por "
+        "ninguna lógica de clasificación. Sirve para ver si este entorno "
+        "está verificando de verdad contra el buzón o si algo en la red "
+        "está aceptando todo sin comprobar nada."
+    )
+    entradas_diagnostico = st.text_area(
+        "Un caso por línea: 'email_real@dominio.com' (se prueba esa + una inventada en el mismo dominio)",
+        value="director@araiindia.com\ncontact@cafindia.org\ndirector@caritasindia.org",
+        height=100,
+    )
+
+    if st.button("Correr diagnóstico SMTP crudo"):
+        with st.spinner("Consultando la IP pública de salida de este entorno..."):
+            ip_publica = _obtener_ip_publica_saliente()
+        if ip_publica:
+            st.write(
+                f"**IP pública de salida de este entorno:** `{ip_publica}` — "
+                f"[chequear reputación en MXToolbox](https://mxtoolbox.com/SuperTool.aspx?action=blacklist%3a{ip_publica})"
+            )
+        else:
+            st.write("**IP pública de salida de este entorno:** no se pudo determinar.")
+
+        for linea in entradas_diagnostico.splitlines():
+            linea = linea.strip()
+            if not linea:
+                continue
+            email_real = linea if "@" in linea else None
+            dominio = linea.split("@")[1] if email_real else linea
+
+            st.markdown(f"---\n**Dominio:** `{dominio}`")
+
+            resultado_mx, mx_host, reason_mx = verificar_mx(dominio, DNS_TIMEOUT_DEFAULT)
+            if resultado_mx != "ok":
+                st.error(f"No se pudo resolver MX ({resultado_mx} / {reason_mx})")
+                continue
+            st.write(f"MX resuelto: `{mx_host}`")
+
+            email_inventado = f"esteusuarionoexiste-diagnostico-{int(time.time())}@{dominio}"
+
+            if email_real:
+                codigo_real, mensaje_real, excepcion_real = _diagnostico_rcpt_crudo(
+                    email_real, mx_host, SMTP_TIMEOUT_DEFAULT
+                )
+                st.code(
+                    f"REAL      {email_real}\n"
+                    f"          codigo={codigo_real!r}  mensaje={mensaje_real!r}  excepcion={excepcion_real!r}"
+                )
+
+            codigo_falso, mensaje_falso, excepcion_falso = _diagnostico_rcpt_crudo(
+                email_inventado, mx_host, SMTP_TIMEOUT_DEFAULT
+            )
+            st.code(
+                f"INVENTADA {email_inventado}\n"
+                f"          codigo={codigo_falso!r}  mensaje={mensaje_falso!r}  excepcion={excepcion_falso!r}"
+            )
+
+            if email_real:
+                if codigo_real == 250 and codigo_falso == 250:
+                    st.warning(
+                        "Las DOS direcciones fueron aceptadas con 250 -> este dominio es "
+                        "catch-all, o la red de este entorno está aceptando el RCPT TO sin "
+                        "verificar de verdad contra el buzón real."
+                    )
+                elif codigo_real == 250 and codigo_falso != 250:
+                    st.success(
+                        "La real fue aceptada (250) y la inventada NO -> el servidor está "
+                        "verificando de verdad. El MANTENER de este entorno es confiable "
+                        "para este dominio."
+                    )
+                elif codigo_real != 250:
+                    st.info(
+                        f"La dirección real NO dio 250 acá (dio {codigo_real!r}) -- "
+                        "no coincide con lo esperado para este caso, revisar a mano."
+                    )
+# ==========================================================================
+# FIN DEL BLOQUE TEMPORAL DE DIAGNOSTICO
+# ==========================================================================
+
 
 archivo_subido = st.file_uploader(
     "Archivo de contactos (CSV o Excel)", type=["csv", "xlsx", "xls"]
