@@ -39,10 +39,13 @@ por SMTP, o usá el checkbox "Desactivar verificación SMTP" de la interfaz.
 
 ## Archivos que genera (carpeta `resultados_limpieza/` por defecto)
 
-- `buenos.xlsx`   -> accion = MANTENER (correos confirmados, o mantenidos por
-                     confianza en proveedores masivos/reputación de IP) —
-                     esta es la lista lista para la campaña (ej. Acumbamail)
-- `revisar.xlsx`  -> accion = REVISAR — para revisión manual
+- `buenos.xlsx`   -> accion = MANTENER — reason = `accepted_email` únicamente:
+                     el servidor confirmó con 250 esa dirección específica Y
+                     se comprobó que el dominio NO es catch-all. Es la única
+                     categoría lista para campaña directa (ej. Acumbamail).
+- `revisar.xlsx`  -> accion = REVISAR — para revisión manual (incluye
+                     bloqueos por reputación de IP, proveedores masivos sin
+                     confirmar, y dominios catch-all — ver más abajo)
 - `eliminar.xlsx` -> accion = ELIMINAR — descarte (sintaxis inválida,
                      desechables, dominio inexistente, rechazo SMTP genuino);
                      ya validado con 100% de precisión contra Bouncer
@@ -56,6 +59,28 @@ esa fila congelada.
 El archivo `lista_negra_local.txt` se puede editar a mano (sin tocar el código)
 para añadir dominios desechables que la librería `disposable-email-domains`
 todavía no incluya. Una línea = un dominio, sin @. Las líneas con # son comentarios.
+
+## Detección de dominios catch-all
+
+Un 250 a `RCPT TO` no siempre confirma que ESA dirección específica exista:
+si el dominio es "catch-all" (acepta con 250 cualquier dirección, real o
+inventada — común en tenants de Microsoft 365 mal configurados), el 250 no
+distingue nada. Por eso, antes de confiar en un `accepted_email`, el script
+prueba (una sola vez por dominio, no por cada email) una dirección
+claramente inventada en ese mismo dominio:
+
+- Si la inventada es rechazada -> el dominio SÍ verifica de verdad, la
+  dirección real va a `buenos.xlsx` (`accepted_email`).
+- Si la inventada también es aceptada -> el dominio es catch-all, la
+  dirección real va a `revisar.xlsx` (`reason = dominio_catch_all`), porque
+  el 250 no prueba que exista.
+- Si no se pudo determinar (la prueba con la inventada no dio una respuesta
+  concluyente) -> va a `revisar.xlsx` (`reason = catchall_no_verificable`).
+
+Detectado comparando contra Bouncer (julio 2026): en un lote de 63 correos
+con `accepted_email` de un dominio catch-all, Bouncer solo confirmó 3 como
+realmente entregables — sin esta detección, los 63 hubiesen sido falsos
+MANTENER.
 
 ## Limitación importante: puerto SMTP (25)
 

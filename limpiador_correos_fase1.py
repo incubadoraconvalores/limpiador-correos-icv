@@ -56,7 +56,13 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
     Correo desechable/temporal      -> Risky / low_quality                    -> ELIMINAR
     Dominio sin registros MX        -> Undeliverable / invalid_domain         -> ELIMINAR
     Error de DNS / timeout DNS      -> Unknown / dns_error                    -> REVISAR
-    SMTP confirma el buzón (250)    -> Deliverable / accepted_email           -> MANTENER
+    SMTP confirma el buzón (250), dominio NO catch-all -> Deliverable / accepted_email -> MANTENER
+    SMTP confirma el buzón (250), pero el dominio
+      es catch-all (acepta CUALQUIER dirección)   -> probable_deliverable / dominio_catch_all -> REVISAR
+                                                      (el 250 no distingue nada, no confirma ESE buzón)
+    No se pudo determinar si el dominio es
+      catch-all (prueba con dirección inventada
+      no concluyente tras reintentos)             -> Unknown / catchall_no_verificable -> REVISAR
     SMTP rechaza (5xx) el buzón, mensaje genuino  -> Undeliverable / rejected_email -> ELIMINAR
     SMTP rechaza (5xx) pero el mensaje indica
       bloqueo por reputación de NUESTRA IP
@@ -66,7 +72,7 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
     SMTP no concluyente (proveedor masivo,
       tras reintentos)                            -> probable_deliverable / smtp_bloqueado_proveedor_masivo -> REVISAR
                                                       (no hay confirmación SMTP real)
-    (catch-all y buzón lleno no se detectan en Fase 1: ver Fase 2)
+    (buzón lleno no se detecta en Fase 1: ver Fase 2)
 
 NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     Muchos servidores corporativos (Microsoft 365 / mail.protection.outlook.com,
@@ -83,6 +89,17 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     -- mandarlos directo a campaña arriesgaría rebotes en la mayoría de los
     casos. buenos.xlsx queda reservado para reason == "accepted_email"
     (confirmación SMTP 100% real).
+
+    ACTUALIZACIÓN 2 (julio 2026): un 250 a RCPT TO tampoco es, por sí solo,
+    prueba de que la dirección exista: si el dominio es "catch-all" (acepta
+    con 250 CUALQUIER dirección, real o inventada -- muy común en tenants
+    de Microsoft 365 mal configurados), el 250 no distingue nada. Se agregó
+    DetectorCatchAll: antes de confiar en un accepted_email, se prueba UNA
+    VEZ POR DOMINIO (no por email) una dirección claramente inventada. Si
+    también da 250, el dominio es catch-all y el correo real va a REVISAR
+    (reason "dominio_catch_all"), no a MANTENER. Detectado comparando contra
+    Bouncer: en un lote de 63 accepted_email de un dominio catch-all, Bouncer
+    solo confirmó 3 como realmente entregables (acceptAll=true en el resto).
 
 Uso:
     python limpiador_correos_fase1.py entrada.xlsx
@@ -105,6 +122,7 @@ import socket
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import dns.resolver
@@ -217,6 +235,81 @@ class LimitadorConcurrenciaPorDominio:
 
     def liberar(self, dominio: str):
         self._semaforo_de(dominio).release()
+
+
+class DetectorCatchAll:
+    """
+    Para cada dominio, verifica UNA SOLA VEZ (memoizado) si el servidor
+    acepta con 250 una dirección claramente inventada. Si la acepta, el
+    dominio es "catch-all": acepta CUALQUIER dirección sin verificar el
+    buzón real, por lo que un 250 a una dirección real de ese dominio NO es
+    una confirmación genuina de que ESA dirección específica exista.
+
+    Detectado comparando contra Bouncer (julio 2026): de 63 correos con
+    accepted_email en dominios M365 configurados como catch-all, Bouncer
+    solo confirmó 3 como realmente entregables (el resto, acceptAll=true) --
+    sin esta detección, los 63 hubiesen ido a MANTENER como falsos positivos.
+
+    Se prueba una sola vez POR DOMINIO, no una vez por email, para no
+    duplicar el tráfico SMTP: si 50 contactos comparten un dominio, se hace
+    1 verificación de catch-all + 50 verificaciones reales, no 100.
+    Thread-safe: si varios hilos llegan al mismo dominio antes de que la
+    primera prueba termine, esperan su resultado en vez de probar cada uno
+    por su cuenta.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._resultados = {}  # dominio -> True / False / None (inconcluyente)
+        self._eventos = {}     # dominio -> threading.Event, mientras se prueba
+
+    def es_catch_all(self, dominio: str, mx_host: str, timeout: float, pausas,
+                      limitador_dominio: "LimitadorConcurrenciaPorDominio" = None):
+        """
+        Devuelve True (catch-all confirmado: el 250 real NO es de fiar),
+        False (no catch-all: el 250 real SÍ confirma el buzón), o None
+        (no se pudo determinar tras los reintentos -- inconcluyente, el
+        llamador debe tratarlo como no confirmado).
+        """
+        with self._lock:
+            if dominio in self._resultados:
+                return self._resultados[dominio]
+            evento = self._eventos.get(dominio)
+            me_toca_probar = evento is None
+            if me_toca_probar:
+                evento = threading.Event()
+                self._eventos[dominio] = evento
+
+        if not me_toca_probar:
+            evento.wait()
+            with self._lock:
+                return self._resultados.get(dominio)
+
+        valor = None
+        try:
+            email_inventado = f"noexiste-verificacion-catchall-{uuid.uuid4().hex}@{dominio}"
+            if limitador_dominio is not None:
+                limitador_dominio.adquirir(dominio)
+            try:
+                resultado_smtp, _ = verificar_smtp_con_reintentos(
+                    email_inventado, mx_host, timeout,
+                    intentos=SMTP_REINTENTOS, pausas=pausas,
+                )
+            finally:
+                if limitador_dominio is not None:
+                    limitador_dominio.liberar(dominio)
+
+            if resultado_smtp == "aceptado":
+                valor = True
+            elif resultado_smtp in ("rechazado", "rechazado_reputacion"):
+                valor = False
+            # cualquier otro caso (no_concluyente) deja valor = None
+        finally:
+            with self._lock:
+                self._resultados[dominio] = valor
+            evento.set()
+
+        return valor
 
 
 def es_rechazo_por_reputacion_propia(mensaje_smtp) -> bool:
@@ -437,7 +530,8 @@ def clasificar_email(email_original: str, lista_negra_local: set,
                       smtp_timeout_proveedor_masivo: float,
                       verificar_smtp_activo: bool,
                       verificacion_paciente: bool = False,
-                      limitador_dominio: "LimitadorConcurrenciaPorDominio" = None):
+                      limitador_dominio: "LimitadorConcurrenciaPorDominio" = None,
+                      detector_catch_all: "DetectorCatchAll" = None):
     """
     Aplica el pipeline completo y devuelve un dict con:
         email, status, reason, accion
@@ -517,6 +611,34 @@ def clasificar_email(email_original: str, lista_negra_local: set,
             limitador_dominio.liberar(dominio)
 
     if resultado_smtp == "aceptado":
+        # Un 250 a la dirección real no es, por sí solo, prueba de que ESA
+        # dirección específica exista: si el dominio es "catch-all" (acepta
+        # con 250 CUALQUIER dirección, real o inventada), el 250 no confirma
+        # nada. Se prueba una vez por dominio (memoizado en detector_catch_all,
+        # no se repite por cada email) antes de confiar en el accepted_email.
+        if detector_catch_all is not None:
+            es_catch_all = detector_catch_all.es_catch_all(
+                dominio, mx_host, timeout_smtp_real, pausas_smtp, limitador_dominio,
+            )
+            if es_catch_all is None:
+                return {
+                    "email": email_normalizado,
+                    "status": "unknown",
+                    "reason": "catchall_no_verificable",
+                    "accion": "REVISAR",
+                }
+            if es_catch_all:
+                # Detectado comparando contra Bouncer (julio 2026): en
+                # dominios catch-all, solo ~5% de los accepted_email
+                # resultaron ser realmente entregables (3 de 63). El 250 de
+                # la dirección real no distingue nada de un 250 a una
+                # dirección inventada, así que no se puede confiar en él.
+                return {
+                    "email": email_normalizado,
+                    "status": "probable_deliverable",
+                    "reason": "dominio_catch_all",
+                    "accion": "REVISAR",
+                }
         return {
             "email": email_normalizado,
             "status": "deliverable",
@@ -902,6 +1024,7 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
     de verificación toquen directamente ninguna UI.
     """
     limitador_dominio = LimitadorConcurrenciaPorDominio(concurrencia_por_dominio)
+    detector_catch_all = DetectorCatchAll()
     emails = list(df_entrada[columna_email])
     filas_clasificacion = [None] * len(emails)
 
@@ -915,6 +1038,7 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
             verificar_smtp_activo=verificar_smtp_activo,
             verificacion_paciente=verificacion_paciente,
             limitador_dominio=limitador_dominio,
+            detector_catch_all=detector_catch_all,
         )
         return indice, fila
 
@@ -1077,18 +1201,32 @@ def main():
         print(f"\nRechazos 5xx por reputación de nuestra IP (no del buzón), enviados "
               f"a REVISAR (probable_deliverable): {bloqueados_reputacion}")
 
+    # Dominios catch-all: el 250 a la dirección real no confirmó nada porque
+    # el servidor acepta cualquier dirección (ver DetectorCatchAll).
+    catch_all_detectados = int((df_resultado["reason"] == "dominio_catch_all").sum())
+    if catch_all_detectados > 0:
+        print(f"\nDominios catch-all detectados (accepted_email no confiable, "
+              f"enviados a REVISAR): {catch_all_detectados}")
+
+    catch_all_no_verificable = int((df_resultado["reason"] == "catchall_no_verificable").sum())
+    if catch_all_no_verificable > 0:
+        print(f"No se pudo determinar si el dominio es catch-all (enviados a REVISAR): "
+              f"{catch_all_no_verificable}")
+
     print("\nArchivos generados:")
     print(f"  - {rutas['buenos']}    (accion = MANTENER, listo para campañas)")
     print(f"  - {rutas['revisar']}   (accion = REVISAR, revisión manual)")
     print(f"  - {rutas['eliminar']}  (accion = ELIMINAR, descarte)")
 
     print("\nListo. Los 3 archivos tienen AutoFiltro y encabezado congelado. "
-          "'buenos.xlsx' contiene solo reason == 'accepted_email' (confirmación SMTP "
-          "100% real). Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
-          "'smtp_bloqueado_proveedor_masivo' (hotmail/outlook/live/aol/yahoo sin confirmar) "
-          "o 'rechazo_por_reputacion_ip_propia' (5xx bloqueado por reputación de nuestra IP, "
-          "no del buzón) — solo ~41% de estos casos resultaron entregables al comparar "
-          "contra Bouncer, por eso van a revisión manual en vez de a la campaña directa.")
+          "'buenos.xlsx' contiene solo reason == 'accepted_email' de dominios confirmados "
+          "NO catch-all (confirmación SMTP real de ESA dirección específica). Dentro de "
+          "'revisar.xlsx', filtrá la columna 'reason' para ver 'smtp_bloqueado_proveedor_masivo' "
+          "(hotmail/outlook/live/aol/yahoo sin confirmar), 'rechazo_por_reputacion_ip_propia' "
+          "(5xx bloqueado por reputación de nuestra IP, no del buzón), 'dominio_catch_all' "
+          "(el dominio acepta cualquier dirección, el 250 no confirma nada) o "
+          "'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
+          "confirmación real, por eso van a revisión manual en vez de a la campaña directa.")
 
 
 if __name__ == "__main__":
