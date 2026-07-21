@@ -920,7 +920,19 @@ def leer_lista_contactos(ruta_entrada, columna_email: str = None, nombre_archivo
 
     # ID único por contacto ORIGINAL (antes de separar celdas con varios
     # correos), para poder reagrupar más adelante todos los correos que
-    # vinieron de una misma fila/contacto de origen.
+    # vinieron de una misma fila/contacto de origen. Es una columna interna
+    # de este script, regenerada siempre desde cero en cada corrida: si el
+    # archivo de entrada YA trae una columna con este mismo nombre (típico
+    # al volver a subir un buenos.xlsx/revisar.xlsx/eliminar.xlsx generado
+    # por una corrida anterior, que la conserva), se descarta esa columna
+    # vieja primero -- sin este guard, pandas tira "cannot insert
+    # id_contacto_original, already exists" al chocar con la existente.
+    if "id_contacto_original" in df.columns:
+        print("[INFO] El archivo de entrada ya traía una columna "
+              "'id_contacto_original' (probablemente de una corrida anterior "
+              "de este script); se descarta y se regenera desde cero para "
+              "esta corrida.")
+        df = df.drop(columns=["id_contacto_original"])
     df.insert(0, "id_contacto_original", range(1, len(df) + 1))
 
     # Separar celdas con múltiples correos en filas independientes,
