@@ -21,7 +21,9 @@ SMTP" de acá abajo si necesitás igual filtrar por sintaxis/dominio/desechables
 """
 
 import threading
+import urllib.request
 
+import dns.resolver
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
@@ -48,6 +50,51 @@ st.caption(
     "Subí tu lista de contactos, verificamos cada correo (sintaxis, dominio, "
     "desechables y SMTP) y descargá los resultados separados en 3 archivos."
 )
+
+# ==========================================================================
+# BLOQUE TEMPORAL DE DIAGNOSTICO -- SACAR DESPUES DE USAR
+# ==========================================================================
+# Objetivo: revisar si la IP de salida ACTUAL de este entorno (que puede
+# cambiar entre reboots de Streamlit Cloud) esta listada en Spamhaus Zen
+# (SBL/XBL/PBL) en este momento. Muchas verificaciones seguidas en poco
+# tiempo pueden hacer que la IP quede listada "en caliente" durante el dia,
+# lo que explicaria resultados que empeoran corrida tras corrida sin que
+# haya cambiado nada en el codigo de clasificacion.
+def _obtener_ip_publica_saliente():
+    try:
+        with urllib.request.urlopen("https://api.ipify.org", timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+with st.expander("🔧 Diagnóstico temporal: IP de salida y Spamhaus (sacar después de usar)", expanded=True):
+    if st.button("Chequear IP de salida y Spamhaus"):
+        with st.spinner("Detectando IP pública de salida de este entorno..."):
+            ip_publica = _obtener_ip_publica_saliente()
+
+        if not ip_publica:
+            st.error("No se pudo determinar la IP pública de salida.")
+        else:
+            st.write(f"**IP pública de salida de este entorno:** `{ip_publica}`")
+            ip_invertida = ".".join(reversed(ip_publica.split(".")))
+            consulta = f"{ip_invertida}.zen.spamhaus.org"
+            try:
+                respuestas = dns.resolver.resolve(consulta, "A", lifetime=5)
+                codigos = [r.to_text() for r in respuestas]
+                st.error(
+                    f"⚠️ LISTADA en Spamhaus Zen ahora mismo: {', '.join(codigos)} "
+                    f"(consulta `{consulta}`). Esto explicaría que las verificaciones SMTP "
+                    "den resultados ambiguos/negativos en casi todos los dominios sin "
+                    "importar el proveedor."
+                )
+            except dns.resolver.NXDOMAIN:
+                st.success(f"✅ NO está listada en Spamhaus Zen (SBL/XBL/PBL) ahora mismo. Consulta: `{consulta}`")
+            except Exception as e:
+                st.warning(f"No se pudo consultar Spamhaus: {e}")
+# ==========================================================================
+# FIN DEL BLOQUE TEMPORAL DE DIAGNOSTICO
+# ==========================================================================
 
 archivo_subido = st.file_uploader(
     "Archivo de contactos (CSV o Excel)", type=["csv", "xlsx", "xls"]
