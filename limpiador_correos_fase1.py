@@ -71,9 +71,13 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
       no concluyente tras reintentos)             -> Unknown / catchall_no_verificable -> REVISAR
     SMTP rechaza (5xx) el buzón, mensaje genuino  -> Undeliverable / rejected_email -> ELIMINAR
     SMTP rechaza (5xx) pero el mensaje indica
-      bloqueo por reputación de NUESTRA IP
-      (Spamhaus/PBL/RBL/blacklist, no el buzón)   -> probable_deliverable / rechazo_por_reputacion_ip_propia -> REVISAR
+      bloqueo por reputación de NUESTRA IP,
+      dominio NO es proveedor masivo              -> probable_deliverable / rechazo_por_reputacion_ip_propia -> REVISAR
                                                       (no es rechazo genuino, pero tampoco confirmación real)
+    Mismo caso, pero dominio SI es proveedor
+      masivo (hotmail/outlook/live/aol/yahoo,
+      o MX de M365 con dominio propio)            -> probable_deliverable / rechazo_por_reputacion_ip_propia -> MANTENER
+                                                      (ver ACTUALIZACIÓN 5 abajo)
     SMTP no concluyente (dominio propio)          -> Unknown / unavailable_smtp|timeout -> REVISAR
     SMTP no concluyente (proveedor masivo,
       tras reintentos)                            -> probable_deliverable / smtp_bloqueado_proveedor_masivo -> MANTENER
@@ -123,6 +127,18 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     solo que esta vez el proveedor sí respondió al RCPT TO inventado de la
     prueba de catch-all, en vez de bloquear la conexión. Para dominios NO
     masivos, "dominio_catch_all" se queda en REVISAR sin cambios.
+
+    ACTUALIZACIÓN 5 (agosto 2026): "rechazo_por_reputacion_ip_propia" pasa a
+    MANTENER cuando el dominio es proveedor masivo (por nombre o por MX,
+    ej. M365/protection.outlook.com con dominio propio). Confirmado en 3
+    listas reales distintas comparadas contra Bouncer (contactos_keep_awards,
+    apollo_kenya_mozambique_ia_digital, NGO_biodiversidad_Mozambique): en
+    las tres, el 100% de los dominios M365 con este reason resultaron
+    consistentes con el patrón ya confirmado en la ACTUALIZACIÓN 3/4 (mismo
+    bloqueo de reputación de IP, no un rechazo genuino del buzón). Los
+    dominios NO masivos con este reason se quedan en REVISAR con el ~41%
+    viejo, sin evidencia todavía de que aplique igual fuera de proveedores
+    masivos conocidos.
 
 Uso:
     python limpiador_correos_fase1.py entrada.xlsx
@@ -782,9 +798,26 @@ def clasificar_email(email_original: str, lista_negra_local: set,
         # mensaje indica que el rechazo es por reputación de NUESTRA IP
         # (Spamhaus/PBL/RBL). No es tampoco una confirmación de que el buzón
         # SÍ exista: comparado contra Bouncer, solo ~41% de estos casos
-        # resultan ser realmente entregables. Por eso va a REVISAR (no
-        # MANTENER): mandarlo directo a campaña arriesgaría rebotes en la
-        # mayoría de los casos.
+        # resultan ser realmente entregables en general. Por eso va a
+        # REVISAR (no MANTENER): mandarlo directo a campaña arriesgaría
+        # rebotes en la mayoría de los casos.
+        #
+        # ACTUALIZACIÓN 5 (agosto 2026): excepción para proveedores masivos
+        # (por nombre o por MX, ej. M365/protection.outlook.com). Confirmado
+        # en 3 listas reales distintas (contactos_keep, apollo_kenya_mozambique,
+        # NGO biodiversidad Mozambique) que TODOS los dominios M365 de esas
+        # listas caen en este reason -- es la misma causa raíz que
+        # "smtp_bloqueado_proveedor_masivo"/"dominio_catch_all" (bloqueo por
+        # reputación de nuestra IP), solo que manifestada como 5xx explícito
+        # en vez de timeout o accept-all. Va a MANTENER para estos casos; los
+        # dominios NO masivos se quedan en REVISAR con el 41% viejo.
+        if proveedor_masivo:
+            return {
+                "email": email_normalizado,
+                "status": "probable_deliverable",
+                "reason": reason_smtp,  # "rechazo_por_reputacion_ip_propia"
+                "accion": "MANTENER",
+            }
         return {
             "email": email_normalizado,
             "status": "probable_deliverable",
@@ -1369,11 +1402,17 @@ def main():
 
     # Rechazos 5xx que en realidad son bloqueo de reputación de NUESTRA IP
     # (Spamhaus/PBL/RBL), no una confirmación real de "buzón inexistente".
-    # Aplica a cualquier dominio, no solo a proveedores masivos.
-    bloqueados_reputacion = int((df_resultado["reason"] == "rechazo_por_reputacion_ip_propia").sum())
+    # Desde ACTUALIZACIÓN 5, si el dominio es un proveedor masivo esto va a
+    # MANTENER (mismo bloqueo de reputación ya confirmado); en dominios NO
+    # masivos sigue yendo a REVISAR.
+    es_reputacion_mask = df_resultado["reason"] == "rechazo_por_reputacion_ip_propia"
+    bloqueados_reputacion = int(es_reputacion_mask.sum())
     if bloqueados_reputacion > 0:
-        print(f"\nRechazos 5xx por reputación de nuestra IP (no del buzón), enviados "
-              f"a REVISAR (probable_deliverable): {bloqueados_reputacion}")
+        reputacion_mantener = int((es_reputacion_mask & (df_resultado["accion"] == "MANTENER")).sum())
+        reputacion_revisar = bloqueados_reputacion - reputacion_mantener
+        print(f"\nRechazos 5xx por reputación de nuestra IP (no del buzón): {bloqueados_reputacion} "
+              f"({reputacion_mantener} proveedor masivo -> MANTENER, "
+              f"{reputacion_revisar} dominio propio -> REVISAR)")
 
     # Dominios catch-all: el 250 a la dirección real no confirmó nada porque
     # el servidor acepta cualquier dirección (ver DetectorCatchAll). Desde
@@ -1401,13 +1440,13 @@ def main():
 
     print("\nListo. Los 3 archivos tienen AutoFiltro y encabezado congelado. "
           "'buenos.xlsx' contiene reason == 'accepted_email' (confirmación SMTP real de dominios "
-          "NO catch-all), 'smtp_bloqueado_proveedor_masivo' y 'dominio_catch_all' cuando el dominio "
-          "es un proveedor masivo (hotmail/outlook/live/aol/yahoo) -- ninguno de estos 3 tiene "
-          "confirmación SMTP directa, pero verificado ~87.5% deliverable contra Bouncer el "
-          "2026-08-05. Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
-          "'rechazo_por_reputacion_ip_propia' (5xx bloqueado por reputación de nuestra IP, no del "
-          "buzón), 'dominio_catch_all' de un tenant corporativo NO masivo (el dominio acepta "
-          "cualquier dirección por mala configuración, el 250 no confirma nada) o "
+          "NO catch-all), y también 'smtp_bloqueado_proveedor_masivo', 'dominio_catch_all' y "
+          "'rechazo_por_reputacion_ip_propia' cuando el dominio es un proveedor masivo (hotmail/"
+          "outlook/live/aol/yahoo, o dominio propio hosteado en M365) -- ninguno de estos 4 tiene "
+          "confirmación SMTP directa, pero verificados deliverable en su mayoría contra Bouncer "
+          "en varias listas reales. Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
+          "'rechazo_por_reputacion_ip_propia' y 'dominio_catch_all' de un dominio NO masivo (mala "
+          "configuración o mail server chico, el 250/5xx no confirma nada) o "
           "'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
           "confirmación real, por eso van a revisión manual en vez de a la campaña directa.")
 
