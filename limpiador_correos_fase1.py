@@ -222,16 +222,26 @@ PROVEEDORES_MASIVOS = {"hotmail", "outlook", "live", "msn", "aol", "yahoo"}
 SMTP_TIMEOUT_PROVEEDOR_MASIVO_DEFAULT = 20  # segundos
 
 # Dominios PROPIOS (ej. "miong.org") pero alojados en la MISMA infraestructura
-# compartida que un proveedor masivo (ej. Microsoft 365) sufren el mismo
-# bloqueo/ambigüedad de catch-all, aunque su nombre de dominio no lo delate.
-# Detectado comparando contra Bouncer (agosto 2026): en una lista de 74
-# contactos de ONGs/consultoras, 32 tenían provider == "outlook.com" según
+# compartida que un proveedor masivo (ej. Microsoft 365, Mimecast) sufren el
+# mismo bloqueo/ambigüedad de catch-all, aunque su nombre de dominio no lo
+# delate. Detectado comparando contra Bouncer (agosto 2026): en una lista de
+# 74 contactos de ONGs/consultoras, 32 tenían provider == "outlook.com" según
 # Bouncer pese a tener dominio propio -- de esos, 25 eran deliverable, pero
 # es_proveedor_masivo(dominio) no los reconocía (su dominio no empieza con
 # "outlook"), así que ninguna de las excepciones de hoy (MANTENER para
-# smtp_bloqueado_proveedor_masivo / dominio_catch_all) los alcanzaba. Se
-# detectan por patrón en el MX real, no en el nombre de dominio.
-PATRONES_MX_PROVEEDOR_MASIVO = ("protection.outlook.com",)
+# smtp_bloqueado_proveedor_masivo / dominio_catch_all / rechazo_por_
+# reputacion_ip_propia) los alcanzaba. Se detectan por patrón en el MX real,
+# no en el nombre de dominio.
+#
+# "mimecast." (sin TLD fijo, para cubrir mimecast.com, mimecast.co.za,
+# mimecast.eu, etc.) agregado el mismo día: ya estaba señalado en la NOTA
+# IMPORTANTE de este docstring (de antes de hoy) como equivalente a M365 para
+# este mismo problema, y se confirmó en 2 listas reales distintas
+# (apollo_kenya_mozambique: creditbank.co.ke/ncbagroup.com vía
+# "mimecast.co.za", ubagroup.com vía "mimecast.com";
+# NGO_biodiversidad_Mozambique: wcs.org vía "mimecast.com", ~20 correos) que
+# TODOS los dominios con MX de Mimecast caen en "rechazo_por_reputacion_ip_propia".
+PATRONES_MX_PROVEEDOR_MASIVO = ("protection.outlook.com", "mimecast.")
 
 # Para proveedores masivos, en vez de una pausa fija entre reintentos se usa
 # una pausa progresiva más larga (espaciar más las conexiones reduce la
