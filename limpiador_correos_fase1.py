@@ -205,6 +205,18 @@ SMTP_PAUSA_ENTRE_REINTENTOS = 2.0  # segundos (dominios NO masivos, sin cambios)
 PROVEEDORES_MASIVOS = {"hotmail", "outlook", "live", "msn", "aol", "yahoo"}
 SMTP_TIMEOUT_PROVEEDOR_MASIVO_DEFAULT = 20  # segundos
 
+# Dominios PROPIOS (ej. "miong.org") pero alojados en la MISMA infraestructura
+# compartida que un proveedor masivo (ej. Microsoft 365) sufren el mismo
+# bloqueo/ambigüedad de catch-all, aunque su nombre de dominio no lo delate.
+# Detectado comparando contra Bouncer (agosto 2026): en una lista de 74
+# contactos de ONGs/consultoras, 32 tenían provider == "outlook.com" según
+# Bouncer pese a tener dominio propio -- de esos, 25 eran deliverable, pero
+# es_proveedor_masivo(dominio) no los reconocía (su dominio no empieza con
+# "outlook"), así que ninguna de las excepciones de hoy (MANTENER para
+# smtp_bloqueado_proveedor_masivo / dominio_catch_all) los alcanzaba. Se
+# detectan por patrón en el MX real, no en el nombre de dominio.
+PATRONES_MX_PROVEEDOR_MASIVO = ("protection.outlook.com",)
+
 # Para proveedores masivos, en vez de una pausa fija entre reintentos se usa
 # una pausa progresiva más larga (espaciar más las conexiones reduce la
 # probabilidad de que el proveedor las detecte como abuso). Un valor por
@@ -233,9 +245,19 @@ CONCURRENCIA_DEFAULT = 12          # verificaciones SMTP simultáneas, en total
 CONCURRENCIA_POR_DOMINIO_DEFAULT = 2  # simultáneas contra el MISMO dominio
 
 
-def es_proveedor_masivo(dominio: str) -> bool:
+def es_proveedor_masivo(dominio: str, mx_host: str = "") -> bool:
+    """
+    True si el dominio ES uno de los proveedores masivos conocidos (por
+    nombre), O si su MX real apunta a la infraestructura compartida de uno
+    de ellos aunque el dominio sea propio (ver PATRONES_MX_PROVEEDOR_MASIVO).
+    'mx_host' es opcional para no romper a quien ya llamaba esta función solo
+    con el dominio (ej. el resumen final, que no tiene el MX a mano).
+    """
     etiqueta = dominio.lower().split(".")[0]
-    return etiqueta in PROVEEDORES_MASIVOS
+    if etiqueta in PROVEEDORES_MASIVOS:
+        return True
+    mx_host_normalizado = (mx_host or "").lower()
+    return any(patron in mx_host_normalizado for patron in PATRONES_MX_PROVEEDOR_MASIVO)
 
 
 class LimitadorConcurrenciaPorDominio:
@@ -645,7 +667,7 @@ def clasificar_email(email_original: str, lista_negra_local: set,
             "accion": "REVISAR",
         }
 
-    proveedor_masivo = es_proveedor_masivo(dominio)
+    proveedor_masivo = es_proveedor_masivo(dominio, mx_host)
     timeout_smtp_real = smtp_timeout_proveedor_masivo if proveedor_masivo else smtp_timeout
     factor_paciencia = FACTOR_VERIFICACION_PACIENTE if verificacion_paciente else 1.0
 
