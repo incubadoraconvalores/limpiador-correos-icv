@@ -219,8 +219,13 @@ elif st.session_state.resultado_final is not None:
     col4.metric("ELIMINAR", len(particiones["eliminar"]), _pct(len(particiones["eliminar"])))
 
     st.subheader("Descargar resultados")
+    # .get() con fallback en vez de acceso directo: sesiones viejas que
+    # quedaron abiertas durante un redeploy pueden no tener esta clave
+    # (agregada en una version posterior del codigo) y el acceso por punto
+    # tira AttributeError en vez de None.
+    nombre_original = st.session_state.get("nombre_archivo_original") or "resultado"
     nombres_archivo = {
-        clave: nombre_archivo_salida(st.session_state.nombre_archivo_original, clave)
+        clave: nombre_archivo_salida(nombre_original, clave)
         for clave in ("buenos", "revisar", "eliminar")
     }
     etiquetas_accion = {"buenos": "MANTENER", "revisar": "REVISAR", "eliminar": "ELIMINAR"}
