@@ -206,7 +206,11 @@ FACTOR_VERIFICACION_PACIENTE = 2.0
 # intentos separados en el tiempo. A diferencia de SMTP_PAUSAS_PROGRESIVAS_*
 # (que solo espacia sub-intentos dentro del mismo ciclo), acá se espera un
 # tramo largo y se repite el ciclo COMPLETO de verificación desde cero.
-REINTENTOS_BLOQUEO_MASIVO = 2  # además del intento original (total: 3)
+REINTENTOS_BLOQUEO_MASIVO = 0  # además del intento original (total: 1) -- desactivado:
+                               # prueba del 2026-08-05 dio 0% de rescate (40/40 correos
+                               # Yahoo/Hotmail siguieron bloqueados tras 3 intentos), y desde
+                               # que smtp_bloqueado_proveedor_masivo va a MANTENER (no REVISAR),
+                               # el reintento ya no cambia ningún resultado -- solo agrega tiempo.
 PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT = 10.0  # segundos
 
 # Verificación SMTP en paralelo (varios correos a la vez, usando hilos: cada
