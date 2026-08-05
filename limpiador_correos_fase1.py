@@ -58,8 +58,14 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
     Error de DNS / timeout DNS      -> Unknown / dns_error                    -> REVISAR
     SMTP confirma el buzón (250), dominio NO catch-all -> Deliverable / accepted_email -> MANTENER
     SMTP confirma el buzón (250), pero el dominio
-      es catch-all (acepta CUALQUIER dirección)   -> probable_deliverable / dominio_catch_all -> REVISAR
-                                                      (el 250 no distingue nada, no confirma ESE buzón)
+      es catch-all (acepta CUALQUIER dirección),
+      dominio NO es proveedor masivo              -> probable_deliverable / dominio_catch_all -> REVISAR
+                                                      (tenant corporativo mal configurado: el 250 no
+                                                      distingue nada, solo ~5% resultó entregable)
+    Mismo caso, pero dominio SI es proveedor
+      masivo (hotmail/outlook/live/aol/yahoo)     -> probable_deliverable / dominio_catch_all -> MANTENER
+                                                      (aceptan cualquier RCPT TO por diseño, no por estar
+                                                      mal configurados -- ver ACTUALIZACIÓN 4 abajo)
     No se pudo determinar si el dominio es
       catch-all (prueba con dirección inventada
       no concluyente tras reintentos)             -> Unknown / catchall_no_verificable -> REVISAR
@@ -106,6 +112,17 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     el 2026-08-05, dio 87.5% deliverable (35/40), 12.5% risky (5/40), 0%
     undeliverable. buenos.xlsx ya no está reservado solo para
     "accepted_email": también incluye "smtp_bloqueado_proveedor_masivo".
+
+    ACTUALIZACIÓN 4 (agosto 2026): "dominio_catch_all" pasa a MANTENER
+    cuando el dominio es un proveedor masivo (hotmail/outlook/live/aol/yahoo).
+    El ~5% viejo (3 de 63) fue medido sobre tenants M365 corporativos mal
+    configurados -- una población distinta. Los proveedores masivos disparan
+    el mismo "catch-all" por diseño (aceptan cualquier RCPT TO para no
+    revelar qué buzones existen), no por error de configuración: es la
+    MISMA muestra Yahoo/Hotmail de la ACTUALIZACIÓN 3 (87.5% deliverable) --
+    solo que esta vez el proveedor sí respondió al RCPT TO inventado de la
+    prueba de catch-all, en vez de bloquear la conexión. Para dominios NO
+    masivos, "dominio_catch_all" se queda en REVISAR sin cambios.
 
 Uso:
     python limpiador_correos_fase1.py entrada.xlsx
@@ -698,6 +715,25 @@ def clasificar_email(email_original: str, lista_negra_local: set,
                 # resultaron ser realmente entregables (3 de 63). El 250 de
                 # la dirección real no distingue nada de un 250 a una
                 # dirección inventada, así que no se puede confiar en él.
+                #
+                # ACTUALIZACIÓN 4 (agosto 2026): esa medición del 5% es sobre
+                # tenants corporativos M365 mal configurados. Los proveedores
+                # masivos (hotmail/outlook/live/aol/yahoo) disparan el mismo
+                # "catch-all" por diseño (aceptan cualquier RCPT TO para no
+                # revelar qué buzones existen, no por estar mal configurados)
+                # -- es la MISMA población de la muestra Yahoo/Hotmail
+                # verificada contra Bouncer el 2026-08-05 (87.5% deliverable),
+                # que cuando la IP está bloqueada cae en
+                # "smtp_bloqueado_proveedor_masivo" (ya va a MANTENER) y
+                # cuando la IP funciona cae acá. Mismo correo, mismo
+                # resultado esperado: MANTENER.
+                if proveedor_masivo:
+                    return {
+                        "email": email_normalizado,
+                        "status": "probable_deliverable",
+                        "reason": "dominio_catch_all",
+                        "accion": "MANTENER",
+                    }
                 return {
                     "email": email_normalizado,
                     "status": "probable_deliverable",
@@ -1318,11 +1354,18 @@ def main():
               f"a REVISAR (probable_deliverable): {bloqueados_reputacion}")
 
     # Dominios catch-all: el 250 a la dirección real no confirmó nada porque
-    # el servidor acepta cualquier dirección (ver DetectorCatchAll).
-    catch_all_detectados = int((df_resultado["reason"] == "dominio_catch_all").sum())
+    # el servidor acepta cualquier dirección (ver DetectorCatchAll). Desde
+    # ACTUALIZACIÓN 4, si el dominio es un proveedor masivo esto va a
+    # MANTENER (aceptan cualquier RCPT TO por diseño); si es un tenant
+    # corporativo mal configurado, sigue yendo a REVISAR.
+    es_catch_all_mask = df_resultado["reason"] == "dominio_catch_all"
+    catch_all_detectados = int(es_catch_all_mask.sum())
     if catch_all_detectados > 0:
-        print(f"\nDominios catch-all detectados (accepted_email no confiable, "
-              f"enviados a REVISAR): {catch_all_detectados}")
+        catch_all_mantener = int((es_catch_all_mask & (df_resultado["accion"] == "MANTENER")).sum())
+        catch_all_revisar = catch_all_detectados - catch_all_mantener
+        print(f"\nDominios catch-all detectados: {catch_all_detectados} "
+              f"({catch_all_mantener} proveedor masivo -> MANTENER, "
+              f"{catch_all_revisar} tenant corporativo -> REVISAR)")
 
     catch_all_no_verificable = int((df_resultado["reason"] == "catchall_no_verificable").sum())
     if catch_all_no_verificable > 0:
@@ -1336,12 +1379,14 @@ def main():
 
     print("\nListo. Los 3 archivos tienen AutoFiltro y encabezado congelado. "
           "'buenos.xlsx' contiene reason == 'accepted_email' (confirmación SMTP real de dominios "
-          "NO catch-all) y también 'smtp_bloqueado_proveedor_masivo' (hotmail/outlook/live/aol/yahoo "
-          "sin confirmación SMTP directa, pero verificado ~87.5% deliverable contra Bouncer el "
-          "2026-08-05). Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
+          "NO catch-all), 'smtp_bloqueado_proveedor_masivo' y 'dominio_catch_all' cuando el dominio "
+          "es un proveedor masivo (hotmail/outlook/live/aol/yahoo) -- ninguno de estos 3 tiene "
+          "confirmación SMTP directa, pero verificado ~87.5% deliverable contra Bouncer el "
+          "2026-08-05. Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
           "'rechazo_por_reputacion_ip_propia' (5xx bloqueado por reputación de nuestra IP, no del "
-          "buzón), 'dominio_catch_all' (el dominio acepta cualquier dirección, el 250 no confirma "
-          "nada) o 'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
+          "buzón), 'dominio_catch_all' de un tenant corporativo NO masivo (el dominio acepta "
+          "cualquier dirección por mala configuración, el 250 no confirma nada) o "
+          "'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
           "confirmación real, por eso van a revisión manual en vez de a la campaña directa.")
 
 
