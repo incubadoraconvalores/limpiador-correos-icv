@@ -37,6 +37,7 @@ from limpiador_correos_fase1 import (
     estandarizar_entrada,
     generar_excel_en_memoria,
     leer_lista_contactos,
+    nombre_archivo_salida,
     particionar_por_accion,
 )
 
@@ -84,6 +85,7 @@ if "hilo_clasificacion" not in st.session_state:
     st.session_state.progreso_total = 0
     st.session_state.resultado_final = None
     st.session_state.error_final = None
+    st.session_state.nombre_archivo_original = None
 
 hay_verificacion_en_curso = st.session_state.hilo_clasificacion is not None
 
@@ -109,6 +111,7 @@ if correr and archivo_subido is not None:
         st.session_state.progreso_total = len(df_entrada)
         st.session_state.resultado_final = None
         st.session_state.error_final = None
+        st.session_state.nombre_archivo_original = archivo_subido.name
 
         # Streamlit solo resuelve st.session_state al "contexto real" de esta
         # sesion (ScriptRunContext) en el hilo que Streamlit maneja para esta
@@ -216,16 +219,15 @@ elif st.session_state.resultado_final is not None:
     col4.metric("ELIMINAR", len(particiones["eliminar"]), _pct(len(particiones["eliminar"])))
 
     st.subheader("Descargar resultados")
-    nombres_archivo = {"buenos": "buenos.xlsx", "revisar": "revisar.xlsx", "eliminar": "eliminar.xlsx"}
-    etiquetas = {
-        "buenos": "⬇️ Descargar buenos.xlsx (MANTENER)",
-        "revisar": "⬇️ Descargar revisar.xlsx (REVISAR)",
-        "eliminar": "⬇️ Descargar eliminar.xlsx (ELIMINAR)",
+    nombres_archivo = {
+        clave: nombre_archivo_salida(st.session_state.nombre_archivo_original, clave)
+        for clave in ("buenos", "revisar", "eliminar")
     }
+    etiquetas_accion = {"buenos": "MANTENER", "revisar": "REVISAR", "eliminar": "ELIMINAR"}
     col_a, col_b, col_c = st.columns(3)
     for columna_ui, clave in zip((col_a, col_b, col_c), ("buenos", "revisar", "eliminar")):
         columna_ui.download_button(
-            etiquetas[clave],
+            f"⬇️ Descargar {nombres_archivo[clave]} ({etiquetas_accion[clave]})",
             data=generar_excel_en_memoria(particiones[clave]),
             file_name=nombres_archivo[clave],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",

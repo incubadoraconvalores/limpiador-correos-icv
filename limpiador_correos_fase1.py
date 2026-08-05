@@ -70,8 +70,9 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
                                                       (no es rechazo genuino, pero tampoco confirmación real)
     SMTP no concluyente (dominio propio)          -> Unknown / unavailable_smtp|timeout -> REVISAR
     SMTP no concluyente (proveedor masivo,
-      tras reintentos)                            -> probable_deliverable / smtp_bloqueado_proveedor_masivo -> REVISAR
-                                                      (no hay confirmación SMTP real)
+      tras reintentos)                            -> probable_deliverable / smtp_bloqueado_proveedor_masivo -> MANTENER
+                                                      (sin confirmación SMTP directa, pero 87.5% deliverable
+                                                      verificado contra Bouncer -- ver ACTUALIZACIÓN 3 abajo)
     (buzón lleno no se detecta en Fase 1: ver Fase 2)
 
 NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
@@ -82,13 +83,10 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     reputación de la IP emisora, no del destinatario. Se detecta por el TEXTO
     del mensaje SMTP (ver PALABRAS_CLAVE_RECHAZO_POR_REPUTACION).
 
-    ACTUALIZACIÓN (julio 2026): tanto este caso como el de proveedores
-    masivos sin confirmar SE MANDAN A REVISAR, no a MANTENER. Al comparar
-    contra Bouncer, solo ~41% de los casos con reason "rechazo_por_reputacion_ip_propia"
-    o "smtp_bloqueado_proveedor_masivo" resultaron ser realmente entregables
-    -- mandarlos directo a campaña arriesgaría rebotes en la mayoría de los
-    casos. buenos.xlsx queda reservado para reason == "accepted_email"
-    (confirmación SMTP 100% real).
+    ACTUALIZACIÓN (julio 2026): "rechazo_por_reputacion_ip_propia" SE MANDA
+    A REVISAR, no a MANTENER. Al comparar contra Bouncer, solo ~41% de esos
+    casos resultaron ser realmente entregables -- mandarlos directo a
+    campaña arriesgaría rebotes en la mayoría de los casos.
 
     ACTUALIZACIÓN 2 (julio 2026): un 250 a RCPT TO tampoco es, por sí solo,
     prueba de que la dirección exista: si el dominio es "catch-all" (acepta
@@ -100,6 +98,14 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     (reason "dominio_catch_all"), no a MANTENER. Detectado comparando contra
     Bouncer: en un lote de 63 accepted_email de un dominio catch-all, Bouncer
     solo confirmó 3 como realmente entregables (acceptAll=true en el resto).
+
+    ACTUALIZACIÓN 3 (agosto 2026): "smtp_bloqueado_proveedor_masivo" pasa a
+    MANTENER. La medición vieja del ~41% mezclaba este reason con
+    "rechazo_por_reputacion_ip_propia" en un solo número; una muestra fresca
+    de 40 correos Yahoo/Hotmail con este reason, verificada contra Bouncer
+    el 2026-08-05, dio 87.5% deliverable (35/40), 12.5% risky (5/40), 0%
+    undeliverable. buenos.xlsx ya no está reservado solo para
+    "accepted_email": también incluye "smtp_bloqueado_proveedor_masivo".
 
 Uso:
     python limpiador_correos_fase1.py entrada.xlsx
@@ -193,6 +199,16 @@ SMTP_PAUSAS_PROGRESIVAS_PROVEEDOR_MASIVO = [5.0, 15.0]  # segundos
 # se activa --verificacion-paciente (prioriza tasa de acierto sobre velocidad).
 FACTOR_VERIFICACION_PACIENTE = 2.0
 
+# Reintentos EXTRA (por encima de los de verificar_smtp_con_reintentos) para
+# proveedores masivos que siguen sin dar una respuesta concluyente. Sospecha:
+# M365 rota entre varios servidores frontend, algunos bloqueados por Spamhaus
+# y otros no, así que un mismo dominio puede dar resultados distintos en
+# intentos separados en el tiempo. A diferencia de SMTP_PAUSAS_PROGRESIVAS_*
+# (que solo espacia sub-intentos dentro del mismo ciclo), acá se espera un
+# tramo largo y se repite el ciclo COMPLETO de verificación desde cero.
+REINTENTOS_BLOQUEO_MASIVO = 2  # además del intento original (total: 3)
+PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT = 10.0  # segundos
+
 # Verificación SMTP en paralelo (varios correos a la vez, usando hilos: cada
 # verificación es I/O de red bloqueante, así que el GIL se libera durante la
 # espera y varios hilos avanzan en simultáneo sin necesidad de asyncio).
@@ -235,6 +251,31 @@ class LimitadorConcurrenciaPorDominio:
 
     def liberar(self, dominio: str):
         self._semaforo_de(dominio).release()
+
+
+class ContadorRescatesBloqueoMasivo:
+    """
+    Cuenta, de forma thread-safe, cuántos correos de proveedores masivos
+    pasaron de "no_concluyente" (camino a smtp_bloqueado_proveedor_masivo) a
+    un resultado confirmado (accepted_email o rechazo real) gracias al
+    reintento largo de REINTENTOS_BLOQUEO_MASIVO. Permite medir si esperar a
+    que rote el servidor frontend realmente ayuda, sin tener que reconstruir
+    ese dato después a partir de df_resultado (que solo guarda el resultado
+    final, no cuántos intentos hicieron falta para llegar a él).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rescatados = 0
+
+    def registrar_rescate(self):
+        with self._lock:
+            self._rescatados += 1
+
+    @property
+    def rescatados(self) -> int:
+        with self._lock:
+            return self._rescatados
 
 
 class DetectorCatchAll:
@@ -531,7 +572,9 @@ def clasificar_email(email_original: str, lista_negra_local: set,
                       verificar_smtp_activo: bool,
                       verificacion_paciente: bool = False,
                       limitador_dominio: "LimitadorConcurrenciaPorDominio" = None,
-                      detector_catch_all: "DetectorCatchAll" = None):
+                      detector_catch_all: "DetectorCatchAll" = None,
+                      pausa_reintento_bloqueo_masivo: float = PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT,
+                      contador_rescates: "ContadorRescatesBloqueoMasivo" = None):
     """
     Aplica el pipeline completo y devuelve un dict con:
         email, status, reason, accion
@@ -599,16 +642,38 @@ def clasificar_email(email_original: str, lista_negra_local: set,
 
     # El límite por dominio se adquiere recién acá (no antes de resolver MX),
     # para no bloquear otros hilos mientras se hace DNS de un dominio distinto.
-    if limitador_dominio is not None:
-        limitador_dominio.adquirir(dominio)
-    try:
-        resultado_smtp, reason_smtp = verificar_smtp_con_reintentos(
-            email_normalizado, mx_host, timeout_smtp_real,
-            intentos=SMTP_REINTENTOS, pausas=pausas_smtp,
-        )
-    finally:
+    #
+    # Reintento largo para proveedores masivos (además del de
+    # verificar_smtp_con_reintentos): sospecha de que M365 rota entre varios
+    # servidores frontend, algunos bloqueados por Spamhaus y otros no, por lo
+    # que un mismo dominio puede dar resultados distintos en intentos
+    # separados en el tiempo. Se repite el ciclo COMPLETO de verificación
+    # (no un único intento suelto) hasta REINTENTOS_BLOQUEO_MASIVO veces más.
+    # El semáforo del dominio se libera durante la espera larga, igual que
+    # entre sub-intentos, para no bloquear otros correos del mismo dominio;
+    # y como cada intento corre en su propio hilo del ThreadPoolExecutor,
+    # el tiempo de espera de este correo no frena la verificación de los demás.
+    intentos_bloqueo_masivo = 1 + (REINTENTOS_BLOQUEO_MASIVO if proveedor_masivo else 0)
+    for intento_bloqueo in range(1, intentos_bloqueo_masivo + 1):
         if limitador_dominio is not None:
-            limitador_dominio.liberar(dominio)
+            limitador_dominio.adquirir(dominio)
+        try:
+            resultado_smtp, reason_smtp = verificar_smtp_con_reintentos(
+                email_normalizado, mx_host, timeout_smtp_real,
+                intentos=SMTP_REINTENTOS, pausas=pausas_smtp,
+            )
+        finally:
+            if limitador_dominio is not None:
+                limitador_dominio.liberar(dominio)
+
+        if resultado_smtp != "no_concluyente":
+            if intento_bloqueo > 1 and contador_rescates is not None \
+                    and resultado_smtp in ("aceptado", "rechazado"):
+                contador_rescates.registrar_rescate()
+            break
+
+        if intento_bloqueo < intentos_bloqueo_masivo:
+            time.sleep(pausa_reintento_bloqueo_masivo * factor_paciencia)
 
     if resultado_smtp == "aceptado":
         # Un 250 a la dirección real no es, por sí solo, prueba de que ESA
@@ -673,16 +738,18 @@ def clasificar_email(email_original: str, lista_negra_local: set,
     # en esta fase, además de timeouts y bloqueos de puerto 25).
     #
     # Excepción: si es un proveedor masivo conocido y ya se agotaron los
-    # reintentos, se etiqueta con la razón específica "smtp_bloqueado_proveedor_masivo"
-    # para dejar visible que no hubo una confirmación SMTP 100% real, pero
-    # igual va a REVISAR (no MANTENER): comparado contra Bouncer, solo ~41%
-    # de estos casos resultan ser realmente entregables.
+    # reintentos, se etiqueta con la razón específica "smtp_bloqueado_proveedor_masivo".
+    # Va a MANTENER (no REVISAR): la medición vieja de ~41% entregable mezclaba
+    # este reason con "rechazo_por_reputacion_ip_propia"; una muestra fresca de
+    # 40 correos Yahoo/Hotmail con este reason, verificada contra Bouncer el
+    # 2026-08-05, dio 87.5% deliverable (35/40) -- ver ACTUALIZACIÓN 3 en el
+    # docstring de esta función.
     if proveedor_masivo:
         return {
             "email": email_normalizado,
             "status": "probable_deliverable",
             "reason": "smtp_bloqueado_proveedor_masivo",
-            "accion": "REVISAR",
+            "accion": "MANTENER",
         }
 
     return {
@@ -995,12 +1062,29 @@ def particionar_por_accion(df_resultado: pd.DataFrame) -> dict:
     }
 
 
-def guardar_resultados(df_resultado: pd.DataFrame, carpeta_salida: str):
+SUFIJOS_ARCHIVO_SALIDA = {"buenos": "bueno", "revisar": "revisar", "eliminar": "malo"}
+
+
+def nombre_archivo_salida(nombre_original: str, particion: str) -> str:
     """
-    Guarda tres archivos:
-        - buenos.xlsx   -> accion == "MANTENER" (listo para campañas)
-        - revisar.xlsx  -> accion == "REVISAR" (revisión manual)
-        - eliminar.xlsx -> accion == "ELIMINAR" (descarte, ya validado)
+    Arma el nombre del archivo de salida a partir del nombre del archivo de
+    entrada, para que quede claro de qué lista sale cada resultado (ej.
+    "Copia de BBDD India - PADOR.csv" -> "Copia de BBDD India - PADOR (bueno).xlsx").
+    'particion' es una de las claves de particionar_por_accion (buenos/revisar/eliminar).
+    Reutilizada tanto por guardar_resultados() (CLI) como por streamlit_app.py,
+    para que el nombre de descarga coincida con el de la carpeta local.
+    """
+    base = Path(nombre_original).stem
+    return f"{base} ({SUFIJOS_ARCHIVO_SALIDA[particion]}).xlsx"
+
+
+def guardar_resultados(df_resultado: pd.DataFrame, carpeta_salida: str, nombre_original: str):
+    """
+    Guarda tres archivos, nombrados a partir de 'nombre_original' (ver
+    nombre_archivo_salida):
+        - "<nombre_original> (bueno).xlsx"    -> accion == "MANTENER" (listo para campañas)
+        - "<nombre_original> (revisar).xlsx"  -> accion == "REVISAR" (revisión manual)
+        - "<nombre_original> (malo).xlsx"     -> accion == "ELIMINAR" (descarte, ya validado)
     Los 3 con todas las columnas originales + status/reason/accion, AutoFiltro
     en los encabezados y esa fila congelada (ver _guardar_hoja_excel).
     """
@@ -1008,7 +1092,7 @@ def guardar_resultados(df_resultado: pd.DataFrame, carpeta_salida: str):
     carpeta.mkdir(parents=True, exist_ok=True)
 
     particiones = particionar_por_accion(df_resultado)
-    rutas = {nombre: carpeta / f"{nombre}.xlsx" for nombre in particiones}
+    rutas = {nombre: carpeta / nombre_archivo_salida(nombre_original, nombre) for nombre in particiones}
 
     for nombre, df_particion in particiones.items():
         _guardar_hoja_excel(df_particion, rutas[nombre])
@@ -1020,7 +1104,8 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
                           dns_timeout: float, smtp_timeout: float, smtp_timeout_proveedor_masivo: float,
                           verificar_smtp_activo: bool, verificacion_paciente: bool,
                           concurrencia: int, concurrencia_por_dominio: int,
-                          mostrar_barra_progreso: bool = True, callback_progreso=None):
+                          mostrar_barra_progreso: bool = True, callback_progreso=None,
+                          pausa_reintento_bloqueo_masivo: float = PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT):
     """
     Clasifica todos los emails de 'df_entrada' en paralelo (hilos, con
     LimitadorConcurrenciaPorDominio para no saturar un mismo dominio) y
@@ -1037,6 +1122,7 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
     """
     limitador_dominio = LimitadorConcurrenciaPorDominio(concurrencia_por_dominio)
     detector_catch_all = DetectorCatchAll()
+    contador_rescates = ContadorRescatesBloqueoMasivo()
     emails = list(df_entrada[columna_email])
     filas_clasificacion = [None] * len(emails)
 
@@ -1051,6 +1137,8 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
             verificacion_paciente=verificacion_paciente,
             limitador_dominio=limitador_dominio,
             detector_catch_all=detector_catch_all,
+            pausa_reintento_bloqueo_masivo=pausa_reintento_bloqueo_masivo,
+            contador_rescates=contador_rescates,
         )
         return indice, fila
 
@@ -1083,6 +1171,13 @@ def clasificar_dataframe(df_entrada: pd.DataFrame, columna_email: str, lista_neg
     df_resultado["status"] = df_clasificacion["status"]
     df_resultado["reason"] = df_clasificacion["reason"]
     df_resultado["accion"] = df_clasificacion["accion"]
+
+    if contador_rescates.rescatados > 0:
+        bloqueados_final = int((df_resultado["reason"] == "smtp_bloqueado_proveedor_masivo").sum())
+        print(f"[INFO] Reintento por rotación de servidor (proveedor masivo): "
+              f"{contador_rescates.rescatados} correo(s) pasaron de bloqueado a confirmado "
+              f"(accepted_email/rejected_email). Quedaron {bloqueados_final} sin confirmar tras "
+              f"agotar los {REINTENTOS_BLOQUEO_MASIVO} reintentos extra.")
 
     return df_resultado, tiempo_total_segundos
 
@@ -1123,6 +1218,14 @@ def main():
                          help="Duplica las pausas progresivas usadas entre reintentos con proveedores "
                               "masivos, para maximizar la tasa de verificación real a costa de que "
                               "el script tarde más en total.")
+    parser.add_argument("--pausa-reintento-bloqueo-masivo", type=float,
+                         default=PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT,
+                         help="Segundos de espera antes de repetir el ciclo completo de verificación "
+                              "SMTP cuando un proveedor masivo (hotmail, outlook, live, aol, yahoo...) "
+                              f"sigue sin dar un resultado concluyente (por defecto {PAUSA_REINTENTO_BLOQUEO_MASIVO_DEFAULT}). "
+                              f"Se hacen hasta {REINTENTOS_BLOQUEO_MASIVO} reintentos extra dándole tiempo "
+                              "a que el proveedor rote de servidor frontend antes de clasificar el correo "
+                              "como smtp_bloqueado_proveedor_masivo.")
     parser.add_argument("--concurrencia", type=int, default=CONCURRENCIA_DEFAULT,
                          help="Cantidad de verificaciones SMTP simultáneas en total "
                               f"(por defecto {CONCURRENCIA_DEFAULT}). Subirlo acelera el procesamiento "
@@ -1171,9 +1274,10 @@ def main():
         verificacion_paciente=args.verificacion_paciente,
         concurrencia=args.concurrencia,
         concurrencia_por_dominio=args.concurrencia_por_dominio,
+        pausa_reintento_bloqueo_masivo=args.pausa_reintento_bloqueo_masivo,
     )
 
-    rutas = guardar_resultados(df_resultado, args.salida)
+    rutas = guardar_resultados(df_resultado, args.salida, Path(args.entrada).name)
 
     print("\n" + "=" * 70)
     print("RESUMEN")
@@ -1231,13 +1335,13 @@ def main():
     print(f"  - {rutas['eliminar']}  (accion = ELIMINAR, descarte)")
 
     print("\nListo. Los 3 archivos tienen AutoFiltro y encabezado congelado. "
-          "'buenos.xlsx' contiene solo reason == 'accepted_email' de dominios confirmados "
-          "NO catch-all (confirmación SMTP real de ESA dirección específica). Dentro de "
-          "'revisar.xlsx', filtrá la columna 'reason' para ver 'smtp_bloqueado_proveedor_masivo' "
-          "(hotmail/outlook/live/aol/yahoo sin confirmar), 'rechazo_por_reputacion_ip_propia' "
-          "(5xx bloqueado por reputación de nuestra IP, no del buzón), 'dominio_catch_all' "
-          "(el dominio acepta cualquier dirección, el 250 no confirma nada) o "
-          "'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
+          "'buenos.xlsx' contiene reason == 'accepted_email' (confirmación SMTP real de dominios "
+          "NO catch-all) y también 'smtp_bloqueado_proveedor_masivo' (hotmail/outlook/live/aol/yahoo "
+          "sin confirmación SMTP directa, pero verificado ~87.5% deliverable contra Bouncer el "
+          "2026-08-05). Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
+          "'rechazo_por_reputacion_ip_propia' (5xx bloqueado por reputación de nuestra IP, no del "
+          "buzón), 'dominio_catch_all' (el dominio acepta cualquier dirección, el 250 no confirma "
+          "nada) o 'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
           "confirmación real, por eso van a revisión manual en vez de a la campaña directa.")
 
 
