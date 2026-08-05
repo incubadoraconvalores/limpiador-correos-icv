@@ -241,7 +241,17 @@ SMTP_TIMEOUT_PROVEEDOR_MASIVO_DEFAULT = 20  # segundos
 # "mimecast.co.za", ubagroup.com vía "mimecast.com";
 # NGO_biodiversidad_Mozambique: wcs.org vía "mimecast.com", ~20 correos) que
 # TODOS los dominios con MX de Mimecast caen en "rechazo_por_reputacion_ip_propia".
-PATRONES_MX_PROVEEDOR_MASIVO = ("protection.outlook.com", "mimecast.")
+#
+# "outlook.com" (antes "protection.outlook.com", ampliado el mismo día):
+# Microsoft usa varios formatos de MX para M365 -- "protection.outlook.com"
+# (el original), pero también "mail.eo.outlook.com" y el más nuevo
+# "mx.microsoft" (sin "outlook" ni "com"). Detectado en BBDD_NPA: nabu.de y
+# focusireland.ie (mail.eo.outlook.com) y sikt.no (mx.microsoft) quedaban en
+# REVISAR pese a que Bouncer los identifica como provider "outlook.com" --
+# es el mismo M365 de siempre, solo que el patrón anterior era demasiado
+# específico. "outlook.com" como substring cubre las tres variantes con
+# "outlook" en el nombre; "mx.microsoft" se agrega aparte para la que no.
+PATRONES_MX_PROVEEDOR_MASIVO = ("outlook.com", "mx.microsoft", "mimecast.")
 
 # Para proveedores masivos, en vez de una pausa fija entre reintentos se usa
 # una pausa progresiva más larga (espaciar más las conexiones reduce la
