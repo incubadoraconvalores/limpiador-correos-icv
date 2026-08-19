@@ -5,18 +5,20 @@ Interfaz web (Streamlit) para el Limpiador de correos - Fase 1.
 
 Sube un archivo (CSV o Excel), corre el mismo pipeline que la CLI
 (estandarización automática de separador/encoding + clasificación de
-correos) y ofrece 3 botones de descarga: buenos.xlsx / revisar.xlsx /
-eliminar.xlsx. No duplica ninguna lógica: todo se reutiliza directamente
-de limpiador_correos_fase1.py.
+correos) y ofrece 2 botones de descarga: buenos.xlsx / eliminar.xlsx.
+No duplica ninguna lógica: todo se reutiliza directamente de
+limpiador_correos_fase1.py.
 
 Uso:
     streamlit run streamlit_app.py
 
 AVISO: si esta app se despliega en un hosting compartido/gratuito que
 bloquea el puerto 25 saliente (común en muchos servicios cloud), la
-verificación SMTP no va a poder conectarse y todo quedará en REVISAR.
-Corré esta interfaz en la misma red/máquina donde ya sabés que la CLI
-puede conectarse por SMTP, o usá el checkbox "Desactivar verificación
+verificación SMTP no va a poder conectarse y todo quedará en MANTENER
+sin confirmación real (ACTUALIZACIÓN 6 de limpiador_correos_fase1.py: ya
+no existe REVISAR, y sin señal SMTP no hay evidencia para mandar nada a
+ELIMINAR). Corré esta interfaz en la misma red/máquina donde ya sabés que
+la CLI puede conectarse por SMTP, o usá el checkbox "Desactivar verificación
 SMTP" de acá abajo si necesitás igual filtrar por sintaxis/dominio/desechables.
 """
 
@@ -48,7 +50,7 @@ st.set_page_config(page_title="Limpiador de correos - Fase 1", page_icon="📧")
 st.title("📧 Limpiador de correos - Fase 1")
 st.caption(
     "Subí tu lista de contactos, verificamos cada correo (sintaxis, dominio, "
-    "desechables y SMTP) y descargá los resultados separados en 3 archivos."
+    "desechables y SMTP) y descargá los resultados separados en 2 archivos."
 )
 
 # ==========================================================================
@@ -105,8 +107,8 @@ with st.expander("Opciones avanzadas"):
         "Desactivar verificación SMTP",
         value=False,
         help="Útil si esta app corre en una red/host que bloquea el puerto 25. "
-             "Los correos con sintaxis y dominio válidos quedarán en REVISAR "
-             "en vez de MANTENER/ELIMINAR.",
+             "Los correos con sintaxis y dominio válidos quedarán en MANTENER "
+             "sin confirmación real (reason 'unsupported').",
     )
     columna_seleccionada = None
     if archivo_subido is not None:
@@ -259,11 +261,10 @@ elif st.session_state.resultado_final is not None:
     def _pct(cantidad):
         return f"{cantidad / total * 100:.1f}%" if total else "0%"
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3 = st.columns(3)
     col1.metric("Total", total)
     col2.metric("MANTENER", len(particiones["buenos"]), _pct(len(particiones["buenos"])))
-    col3.metric("REVISAR", len(particiones["revisar"]), _pct(len(particiones["revisar"])))
-    col4.metric("ELIMINAR", len(particiones["eliminar"]), _pct(len(particiones["eliminar"])))
+    col3.metric("ELIMINAR", len(particiones["eliminar"]), _pct(len(particiones["eliminar"])))
 
     st.subheader("Descargar resultados")
     # .get() con fallback en vez de acceso directo: sesiones viejas que
@@ -273,11 +274,11 @@ elif st.session_state.resultado_final is not None:
     nombre_original = st.session_state.get("nombre_archivo_original") or "resultado"
     nombres_archivo = {
         clave: nombre_archivo_salida(nombre_original, clave)
-        for clave in ("buenos", "revisar", "eliminar")
+        for clave in ("buenos", "eliminar")
     }
-    etiquetas_accion = {"buenos": "MANTENER", "revisar": "REVISAR", "eliminar": "ELIMINAR"}
-    col_a, col_b, col_c = st.columns(3)
-    for columna_ui, clave in zip((col_a, col_b, col_c), ("buenos", "revisar", "eliminar")):
+    etiquetas_accion = {"buenos": "MANTENER", "eliminar": "ELIMINAR"}
+    col_a, col_b = st.columns(2)
+    for columna_ui, clave in zip((col_a, col_b), ("buenos", "eliminar")):
         columna_ui.download_button(
             f"⬇️ Descargar {nombres_archivo[clave]} ({etiquetas_accion[clave]})",
             data=generar_excel_en_memoria(particiones[clave]),

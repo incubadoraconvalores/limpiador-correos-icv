@@ -6,16 +6,20 @@ CON VALORES - Departamento de Innovación
 
 Lee una lista de contactos (CSV o Excel), verifica cada correo con los
 mismos criterios que usaba Bouncer (userbouncer.com) hasta donde es posible
-replicar de forma gratuita y local, y genera TRES archivos de salida:
+replicar de forma gratuita y local, y genera DOS archivos de salida:
 
-    - buenos.xlsx   -> filas con accion = "MANTENER" (correos confirmados o
-                       mantenidos por confianza en proveedores masivos/
-                       reputación de IP). Lista para enviar campañas.
-    - revisar.xlsx  -> filas con accion = "REVISAR", para revisión manual.
-    - eliminar.xlsx -> filas con accion = "ELIMINAR" (ya validado con 100%
-                       de precisión contra Bouncer, no necesita revisión).
+    - buenos.xlsx   -> filas con accion = "MANTENER" (correos confirmados,
+                       o mantenidos por confianza en proveedores masivos/
+                       reputación de IP/falta de evidencia -- ver
+                       ACTUALIZACIÓN 6). Lista para enviar campañas.
+    - eliminar.xlsx -> filas con accion = "ELIMINAR" (ya validado con alta
+                       precisión contra Bouncer, no necesita revisión).
 
-    Los 3 con todas las columnas originales + status/reason/accion, con
+    ACTUALIZACIÓN 6 (agosto 2026): se eliminó la acción REVISAR -- todo se
+    reparte entre estos dos archivos (ver detalle más abajo). Ya no hay
+    revisión manual intermedia.
+
+    Los 2 con todas las columnas originales + status/reason/accion, con
     AutoFiltro activado en la fila de encabezados y esa fila congelada
     (freeze panes) para filtrar sin pasos manuales adicionales.
 
@@ -47,7 +51,7 @@ Novedades de esta versión:
       varias conexiones a la vez al mismo proveedor masivo. Al final se
       informa el tiempo total de verificación.
     - Interfaz web opcional (streamlit_app.py): subir un archivo, correr todo
-      el pipeline y descargar los 3 documentos sin usar la terminal.
+      el pipeline y descargar los 2 documentos sin usar la terminal.
       Ver "streamlit run streamlit_app.py".
 
 LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
@@ -55,30 +59,45 @@ LÓGICA DE CLASIFICACIÓN (conservadora, sin heurísticas aproximadas):
     Sintaxis inválida               -> Undeliverable / invalid_email          -> ELIMINAR
     Correo desechable/temporal      -> Risky / low_quality                    -> ELIMINAR
     Dominio sin registros MX        -> Undeliverable / invalid_domain         -> ELIMINAR
-    Error de DNS / timeout DNS      -> Unknown / dns_error                    -> REVISAR
+    Error de DNS tras reintentos    -> Unknown / dns_error                    -> MANTENER
+                                                      (no dice nada del buzón, es un fallo de red
+                                                      nuestro -- ver ACTUALIZACIÓN 6)
+    Verificación SMTP desactivada   -> Unknown / unsupported                  -> MANTENER
+                                                      (sin ninguna señal sobre el buzón -- ídem)
     SMTP confirma el buzón (250), dominio NO catch-all -> Deliverable / accepted_email -> MANTENER
     SMTP confirma el buzón (250), pero el dominio
       es catch-all (acepta CUALQUIER dirección),
-      dominio NO es proveedor masivo              -> probable_deliverable / dominio_catch_all -> REVISAR
+      dominio NO es proveedor masivo              -> probable_deliverable / dominio_catch_all -> ELIMINAR
                                                       (tenant corporativo mal configurado: el 250 no
-                                                      distingue nada, solo ~5% resultó entregable)
+                                                      distingue nada, 0-25% resultó entregable en 4 de 5
+                                                      listas reales -- ver ACTUALIZACIÓN 6)
     Mismo caso, pero dominio SI es proveedor
       masivo (hotmail/outlook/live/aol/yahoo)     -> probable_deliverable / dominio_catch_all -> MANTENER
                                                       (aceptan cualquier RCPT TO por diseño, no por estar
                                                       mal configurados -- ver ACTUALIZACIÓN 4 abajo)
     No se pudo determinar si el dominio es
       catch-all (prueba con dirección inventada
-      no concluyente tras reintentos)             -> Unknown / catchall_no_verificable -> REVISAR
+      no concluyente tras reintentos)             -> Unknown / catchall_no_verificable -> MANTENER
+                                                      (sin evidencia -- ver ACTUALIZACIÓN 6)
     SMTP rechaza (5xx) el buzón, mensaje genuino  -> Undeliverable / rejected_email -> ELIMINAR
     SMTP rechaza (5xx) pero el mensaje indica
       bloqueo por reputación de NUESTRA IP,
-      dominio NO es proveedor masivo              -> probable_deliverable / rechazo_por_reputacion_ip_propia -> REVISAR
-                                                      (no es rechazo genuino, pero tampoco confirmación real)
+      dominio NO es proveedor masivo Y se confirma
+      que el dominio NO es catch-all              -> probable_deliverable / rechazo_por_reputacion_ip_propia -> MANTENER
+                                                      (no es rechazo genuino; confirmado ~100% deliverable
+                                                      cuando el dominio no es catch-all -- ACTUALIZACIÓN 6)
+    Mismo caso, pero al probar SÍ resulta
+      catch-all                                   -> se reclasifica como dominio_catch_all (ver arriba)
     Mismo caso, pero dominio SI es proveedor
       masivo (hotmail/outlook/live/aol/yahoo,
-      o MX de M365 con dominio propio)            -> probable_deliverable / rechazo_por_reputacion_ip_propia -> MANTENER
+      o MX de M365/Mimecast con dominio propio)   -> probable_deliverable / rechazo_por_reputacion_ip_propia -> MANTENER
                                                       (ver ACTUALIZACIÓN 5 abajo)
-    SMTP no concluyente (dominio propio)          -> Unknown / unavailable_smtp|timeout -> REVISAR
+    SMTP no concluyente (dominio propio),
+      se confirma que el dominio NO es catch-all  -> probable_deliverable / unavailable_smtp|timeout|unknown -> MANTENER
+                                                      (confirmado ~98% deliverable cuando el dominio no es
+                                                      catch-all -- ver ACTUALIZACIÓN 6)
+    Mismo caso, pero al probar SÍ resulta
+      catch-all                                   -> se reclasifica como dominio_catch_all (ver arriba)
     SMTP no concluyente (proveedor masivo,
       tras reintentos)                            -> probable_deliverable / smtp_bloqueado_proveedor_masivo -> MANTENER
                                                       (sin confirmación SMTP directa, pero 87.5% deliverable
@@ -139,6 +158,40 @@ NOTA IMPORTANTE (detectado en julio 2026, comparando contra Bouncer):
     dominios NO masivos con este reason se quedan en REVISAR con el ~41%
     viejo, sin evidencia todavía de que aplique igual fuera de proveedores
     masivos conocidos.
+
+    ACTUALIZACIÓN 6 (agosto 2026): se elimina la acción REVISAR por
+    completo -- ya no hay tercera categoría, todo se reparte entre MANTENER
+    y ELIMINAR. La organización prioriza no perder contactos por sobre el
+    riesgo de algún rebote ocasional, y prefiere no depender de revisión
+    manual. Reglas aplicadas:
+
+    - "dominio_catch_all" (dominio NO masivo): pasa de REVISAR a ELIMINAR.
+      Confirmado contra Bouncer en 5 listas reales (contactos_keep_awards,
+      apollo_kenya_mozambique, NGO_biodiversidad_Mozambique, BBDD_NPA,
+      malos_IsDB_experts): 4 de 5 coinciden en tasa baja (0-25% deliverable,
+      106 correos en total, un solo outlier en 71%). No es "perder
+      contactos": la evidencia dice que la mayoría de esas direcciones no
+      existen.
+
+    - Se extendió la prueba de catch-all (DetectorCatchAll, la misma que ya
+      se usaba para "accepted_email") a los casos "rechazo_por_reputacion_
+      ip_propia" y "no concluyente" (unavailable_smtp/timeout/unknown) en
+      dominios NO masivos, que antes iban directo a REVISAR sin probarla.
+      Confirmado contra Bouncer (74 correos, 3 listas reales, patrón
+      consistente por lista sin outliers):
+        - Si el dominio NO es catch-all -> MANTENER (98-100% deliverable).
+        - Si el dominio SÍ es catch-all -> se reclasifica como
+          "dominio_catch_all" (mismo tratamiento: ELIMINAR).
+      "timeout" y "unknown" comparten el mismo camino de código que
+      "unavailable_smtp" pero no tienen muestra propia verificada
+      (insuficiente); se les aplica el mismo mecanismo por analogía, ya que
+      el chequeo de catch-all es una propiedad del DOMINIO, no del reason
+      que disparó la verificación.
+
+    - "dns_error", "unsupported" y "catchall_no_verificable" pasan a
+      MANTENER SIN evidencia de deliverabilidad real -- es una decisión de
+      política (pedida explícitamente), no un hallazgo de datos: ante la
+      ausencia de cualquier señal, se prioriza no perder el contacto.
 
 Uso:
     python limpiador_correos_fase1.py entrada.xlsx
@@ -517,32 +570,46 @@ def validar_sintaxis(email: str):
 # VERIFICACIÓN DNS (REGISTROS MX)
 # --------------------------------------------------------------------------
 
+# Reintentos para timeouts de DNS (agosto 2026): un timeout de DNS no dice
+# nada del dominio, es un fallo de red transitorio nuestro -- reintentar una
+# vez más antes de darlo por "dns_error" reduce cuántos correos caen ahí sin
+# necesidad (ver ACTUALIZACIÓN 6: dns_error ahora va a MANTENER, así que
+# menos casos ahí es directamente menos incertidumbre real).
+DNS_REINTENTOS = 2  # intento original + 1 reintento
+DNS_PAUSA_ENTRE_REINTENTOS = 1.0  # segundos
+
+
 def verificar_mx(dominio: str, timeout: float):
     """
     Devuelve una tupla (resultado, mx_host, reason) donde resultado es uno de:
         "ok"         -> hay registros MX, mx_host es el de mayor prioridad
         "sin_mx"     -> el dominio no tiene registros MX (Undeliverable)
-        "dns_error"  -> no se pudo resolver por timeout/error de red (Unknown)
+        "dns_error"  -> no se pudo resolver tras DNS_REINTENTOS intentos
+                        por timeout/error de red (Unknown)
     """
-    try:
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = timeout
-        resolver.lifetime = timeout
-        respuestas = resolver.resolve(dominio, "MX")
-        registros = sorted(respuestas, key=lambda r: r.preference)
-        mx_host = str(registros[0].exchange).rstrip(".")
-        return "ok", mx_host, None
+    for intento in range(1, DNS_REINTENTOS + 1):
+        try:
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = timeout
+            resolver.lifetime = timeout
+            respuestas = resolver.resolve(dominio, "MX")
+            registros = sorted(respuestas, key=lambda r: r.preference)
+            mx_host = str(registros[0].exchange).rstrip(".")
+            return "ok", mx_host, None
 
-    except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
-        return "sin_mx", None, "invalid_domain"
+        except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
+            return "sin_mx", None, "invalid_domain"
 
-    except (dns.exception.Timeout, dns.resolver.LifetimeTimeout):
-        return "dns_error", None, "dns_error"
+        except (dns.exception.Timeout, dns.resolver.LifetimeTimeout):
+            if intento < DNS_REINTENTOS:
+                time.sleep(DNS_PAUSA_ENTRE_REINTENTOS)
+                continue
+            return "dns_error", None, "dns_error"
 
-    except Exception:
-        # Cualquier otro fallo de resolución se trata como error transitorio,
-        # no como "el dominio no existe" (para evitar falsos positivos).
-        return "dns_error", None, "dns_error"
+        except Exception:
+            # Cualquier otro fallo de resolución se trata como error transitorio,
+            # no como "el dominio no existe" (para evitar falsos positivos).
+            return "dns_error", None, "dns_error"
 
 
 # --------------------------------------------------------------------------
@@ -637,6 +704,46 @@ def verificar_smtp_con_reintentos(email: str, mx_host: str, timeout: float,
     return resultado, reason
 
 
+def _resultado_por_catchall(dominio: str, mx_host: str, timeout_smtp_real: float, pausas_smtp,
+                             limitador_dominio: "LimitadorConcurrenciaPorDominio",
+                             detector_catch_all: "DetectorCatchAll", proveedor_masivo: bool):
+    """
+    Corre (o reutiliza, memoizado por dominio en detector_catch_all) la
+    prueba de catch-all -- la misma que ya se usaba solo para "accepted_email"
+    -- y devuelve un dict con status/reason/accion YA ARMADO si el catch-all
+    se confirmó o si la prueba en sí fue inconclusa. Devuelve None si el
+    dominio NO es catch-all: en ese caso el llamador arma su propio
+    resultado, porque cada camino que llega acá (aceptado, rechazo por
+    reputación, no concluyente) ya tiene su propio reason calculado y ahora
+    sabe que el dominio no es catch-all (ACTUALIZACIÓN 6: confirmado ~98-100%
+    deliverable contra Bouncer en esos casos).
+
+    Si detector_catch_all es None (no se pasó), siempre devuelve None --
+    mismo comportamiento que si nunca se hubiera probado catch-all.
+
+    No incluye "email" en el dict devuelto; el llamador debe agregarlo.
+    """
+    if detector_catch_all is None:
+        return None
+
+    es_catch_all = detector_catch_all.es_catch_all(
+        dominio, mx_host, timeout_smtp_real, pausas_smtp, limitador_dominio,
+    )
+    if es_catch_all is None:
+        return {
+            "status": "unknown",
+            "reason": "catchall_no_verificable",
+            "accion": "MANTENER",
+        }
+    if es_catch_all:
+        return {
+            "status": "probable_deliverable",
+            "reason": "dominio_catch_all",
+            "accion": "MANTENER" if proveedor_masivo else "ELIMINAR",
+        }
+    return None
+
+
 # --------------------------------------------------------------------------
 # CLASIFICACIÓN COMPLETA DE UN CORREO
 # --------------------------------------------------------------------------
@@ -687,20 +794,26 @@ def clasificar_email(email_original: str, lista_negra_local: set,
         }
 
     if resultado_mx == "dns_error":
+        # ACTUALIZACIÓN 6 (agosto 2026): sin evidencia sobre la tasa real de
+        # entregabilidad de estos casos (no dice nada del buzón, es un fallo
+        # de red nuestro) -- REVISAR se elimina como categoría, se prioriza
+        # no perder contactos. Ver docstring de clasificar_email.
         return {
             "email": email_normalizado,
             "status": "unknown",
             "reason": "dns_error",
-            "accion": "REVISAR",
+            "accion": "MANTENER",
         }
 
     # 4) SMTP (opcional, puede desactivarse si la red bloquea el puerto 25)
     if not verificar_smtp_activo:
+        # ACTUALIZACIÓN 6: sin verificación SMTP no hay ninguna señal sobre
+        # el buzón -- mismo criterio que dns_error, MANTENER por defecto.
         return {
             "email": email_normalizado,
             "status": "unknown",
             "reason": "unsupported",
-            "accion": "REVISAR",
+            "accion": "MANTENER",
         }
 
     proveedor_masivo = es_proveedor_masivo(dominio, mx_host)
@@ -756,48 +869,16 @@ def clasificar_email(email_original: str, lista_negra_local: set,
         # con 250 CUALQUIER dirección, real o inventada), el 250 no confirma
         # nada. Se prueba una vez por dominio (memoizado en detector_catch_all,
         # no se repite por cada email) antes de confiar en el accepted_email.
-        if detector_catch_all is not None:
-            es_catch_all = detector_catch_all.es_catch_all(
-                dominio, mx_host, timeout_smtp_real, pausas_smtp, limitador_dominio,
-            )
-            if es_catch_all is None:
-                return {
-                    "email": email_normalizado,
-                    "status": "unknown",
-                    "reason": "catchall_no_verificable",
-                    "accion": "REVISAR",
-                }
-            if es_catch_all:
-                # Detectado comparando contra Bouncer (julio 2026): en
-                # dominios catch-all, solo ~5% de los accepted_email
-                # resultaron ser realmente entregables (3 de 63). El 250 de
-                # la dirección real no distingue nada de un 250 a una
-                # dirección inventada, así que no se puede confiar en él.
-                #
-                # ACTUALIZACIÓN 4 (agosto 2026): esa medición del 5% es sobre
-                # tenants corporativos M365 mal configurados. Los proveedores
-                # masivos (hotmail/outlook/live/aol/yahoo) disparan el mismo
-                # "catch-all" por diseño (aceptan cualquier RCPT TO para no
-                # revelar qué buzones existen, no por estar mal configurados)
-                # -- es la MISMA población de la muestra Yahoo/Hotmail
-                # verificada contra Bouncer el 2026-08-05 (87.5% deliverable),
-                # que cuando la IP está bloqueada cae en
-                # "smtp_bloqueado_proveedor_masivo" (ya va a MANTENER) y
-                # cuando la IP funciona cae acá. Mismo correo, mismo
-                # resultado esperado: MANTENER.
-                if proveedor_masivo:
-                    return {
-                        "email": email_normalizado,
-                        "status": "probable_deliverable",
-                        "reason": "dominio_catch_all",
-                        "accion": "MANTENER",
-                    }
-                return {
-                    "email": email_normalizado,
-                    "status": "probable_deliverable",
-                    "reason": "dominio_catch_all",
-                    "accion": "REVISAR",
-                }
+        # Detectado comparando contra Bouncer (julio 2026): en dominios
+        # catch-all, solo ~5% de los accepted_email resultaron ser realmente
+        # entregables (3 de 63) -- ver ACTUALIZACIÓN 4 y 6 en el docstring.
+        resultado_catchall = _resultado_por_catchall(
+            dominio, mx_host, timeout_smtp_real, pausas_smtp,
+            limitador_dominio, detector_catch_all, proveedor_masivo,
+        )
+        if resultado_catchall is not None:
+            resultado_catchall["email"] = email_normalizado
+            return resultado_catchall
         return {
             "email": email_normalizado,
             "status": "deliverable",
@@ -816,21 +897,12 @@ def clasificar_email(email_original: str, lista_negra_local: set,
     if resultado_smtp == "rechazado_reputacion":
         # El 5xx no es una confirmación real de "buzón inexistente": el
         # mensaje indica que el rechazo es por reputación de NUESTRA IP
-        # (Spamhaus/PBL/RBL). No es tampoco una confirmación de que el buzón
-        # SÍ exista: comparado contra Bouncer, solo ~41% de estos casos
-        # resultan ser realmente entregables en general. Por eso va a
-        # REVISAR (no MANTENER): mandarlo directo a campaña arriesgaría
-        # rebotes en la mayoría de los casos.
+        # (Spamhaus/PBL/RBL), no del buzón.
         #
         # ACTUALIZACIÓN 5 (agosto 2026): excepción para proveedores masivos
-        # (por nombre o por MX, ej. M365/protection.outlook.com). Confirmado
-        # en 3 listas reales distintas (contactos_keep, apollo_kenya_mozambique,
-        # NGO biodiversidad Mozambique) que TODOS los dominios M365 de esas
-        # listas caen en este reason -- es la misma causa raíz que
-        # "smtp_bloqueado_proveedor_masivo"/"dominio_catch_all" (bloqueo por
-        # reputación de nuestra IP), solo que manifestada como 5xx explícito
-        # en vez de timeout o accept-all. Va a MANTENER para estos casos; los
-        # dominios NO masivos se quedan en REVISAR con el 41% viejo.
+        # (por nombre o por MX, ej. M365/Mimecast con dominio propio) --
+        # misma causa raíz que "smtp_bloqueado_proveedor_masivo"/
+        # "dominio_catch_all", confirmada en 3 listas reales. Va a MANTENER.
         if proveedor_masivo:
             return {
                 "email": email_normalizado,
@@ -838,23 +910,34 @@ def clasificar_email(email_original: str, lista_negra_local: set,
                 "reason": reason_smtp,  # "rechazo_por_reputacion_ip_propia"
                 "accion": "MANTENER",
             }
+        # ACTUALIZACIÓN 6 (agosto 2026): para dominios NO masivos, en vez de
+        # ir directo a REVISAR (basado en un ~41% viejo sin re-verificar),
+        # se prueba catch-all -- misma lógica que ya se usaba para
+        # "accepted_email". Confirmado contra Bouncer (74 correos, 3 listas,
+        # patrón consistente por lista): si el dominio NO es catch-all, casi
+        # siempre es una confirmación indirecta válida (~100% deliverable).
+        resultado_catchall = _resultado_por_catchall(
+            dominio, mx_host, timeout_smtp_real, pausas_smtp,
+            limitador_dominio, detector_catch_all, proveedor_masivo,
+        )
+        if resultado_catchall is not None:
+            resultado_catchall["email"] = email_normalizado
+            return resultado_catchall
         return {
             "email": email_normalizado,
             "status": "probable_deliverable",
             "reason": reason_smtp,  # "rechazo_por_reputacion_ip_propia"
-            "accion": "REVISAR",
+            "accion": "MANTENER",
         }
 
-    # no_concluyente -> Unknown (incluye catch-all y buzón lleno no detectables
-    # en esta fase, además de timeouts y bloqueos de puerto 25).
+    # no_concluyente -> incluye catch-all y buzón lleno no detectables en
+    # esta fase, además de timeouts y bloqueos de puerto 25.
     #
     # Excepción: si es un proveedor masivo conocido y ya se agotaron los
     # reintentos, se etiqueta con la razón específica "smtp_bloqueado_proveedor_masivo".
-    # Va a MANTENER (no REVISAR): la medición vieja de ~41% entregable mezclaba
-    # este reason con "rechazo_por_reputacion_ip_propia"; una muestra fresca de
-    # 40 correos Yahoo/Hotmail con este reason, verificada contra Bouncer el
-    # 2026-08-05, dio 87.5% deliverable (35/40) -- ver ACTUALIZACIÓN 3 en el
-    # docstring de esta función.
+    # Va a MANTENER: una muestra fresca de 40 correos Yahoo/Hotmail con este
+    # reason, verificada contra Bouncer el 2026-08-05, dio 87.5% deliverable
+    # (35/40) -- ver ACTUALIZACIÓN 3 en el docstring de esta función.
     if proveedor_masivo:
         return {
             "email": email_normalizado,
@@ -863,11 +946,28 @@ def clasificar_email(email_original: str, lista_negra_local: set,
             "accion": "MANTENER",
         }
 
+    # ACTUALIZACIÓN 6 (agosto 2026): para dominios NO masivos, en vez de ir
+    # directo a REVISAR, se prueba catch-all antes de decidir -- mismo
+    # mecanismo ya usado para "accepted_email" y "rechazo_por_reputacion_
+    # ip_propia". Confirmado contra Bouncer (77 correos reason=unavailable_smtp,
+    # 3 listas, patrón consistente por lista sin outliers): si el dominio NO
+    # es catch-all, ~98% resulta deliverable. "timeout"/"unknown" comparten
+    # este mismo camino de código; se les aplica el mismo criterio por
+    # analogía (el chequeo es una propiedad del dominio, no del reason que
+    # disparó la verificación), aunque no tienen muestra propia verificada.
+    resultado_catchall = _resultado_por_catchall(
+        dominio, mx_host, timeout_smtp_real, pausas_smtp,
+        limitador_dominio, detector_catch_all, proveedor_masivo,
+    )
+    if resultado_catchall is not None:
+        resultado_catchall["email"] = email_normalizado
+        return resultado_catchall
+
     return {
         "email": email_normalizado,
-        "status": "unknown",
+        "status": "probable_deliverable",
         "reason": reason_smtp,
-        "accion": "REVISAR",
+        "accion": "MANTENER",
     }
 
 
@@ -1101,8 +1201,8 @@ def leer_lista_contactos(ruta_entrada, columna_email: str = None, nombre_archivo
     # vinieron de una misma fila/contacto de origen. Es una columna interna
     # de este script, regenerada siempre desde cero en cada corrida: si el
     # archivo de entrada YA trae una columna con este mismo nombre (típico
-    # al volver a subir un buenos.xlsx/revisar.xlsx/eliminar.xlsx generado
-    # por una corrida anterior, que la conserva), se descarta esa columna
+    # al volver a subir un bueno.xlsx/malo.xlsx generado por una corrida
+    # anterior, que la conserva), se descarta esa columna
     # vieja primero -- sin este guard, pandas tira "cannot insert
     # id_contacto_original, already exists" al chocar con la existente.
     if "id_contacto_original" in df.columns:
@@ -1161,19 +1261,21 @@ def generar_excel_en_memoria(df: pd.DataFrame, sheet_name: str = "Resultado") ->
 
 def particionar_por_accion(df_resultado: pd.DataFrame) -> dict:
     """
-    Devuelve {'buenos': df, 'revisar': df, 'eliminar': df} filtrando por
-    accion == "MANTENER"/"REVISAR"/"ELIMINAR" respectivamente. No cambia
-    ningún criterio de clasificación, solo particiona el resultado ya
-    calculado por clasificar_email().
+    Devuelve {'buenos': df, 'eliminar': df} filtrando por
+    accion == "MANTENER"/"ELIMINAR" respectivamente. No cambia ningún
+    criterio de clasificación, solo particiona el resultado ya calculado
+    por clasificar_email().
+
+    ACTUALIZACIÓN 6 (agosto 2026): ya no existe la partición "revisar" --
+    accion nunca vale "REVISAR" (ver docstring de clasificar_email).
     """
     return {
         "buenos": df_resultado[df_resultado["accion"] == "MANTENER"].reset_index(drop=True),
-        "revisar": df_resultado[df_resultado["accion"] == "REVISAR"].reset_index(drop=True),
         "eliminar": df_resultado[df_resultado["accion"] == "ELIMINAR"].reset_index(drop=True),
     }
 
 
-SUFIJOS_ARCHIVO_SALIDA = {"buenos": "bueno", "revisar": "revisar", "eliminar": "malo"}
+SUFIJOS_ARCHIVO_SALIDA = {"buenos": "bueno", "eliminar": "malo"}
 
 
 def nombre_archivo_salida(nombre_original: str, particion: str) -> str:
@@ -1181,7 +1283,7 @@ def nombre_archivo_salida(nombre_original: str, particion: str) -> str:
     Arma el nombre del archivo de salida a partir del nombre del archivo de
     entrada, para que quede claro de qué lista sale cada resultado (ej.
     "Copia de BBDD India - PADOR.csv" -> "Copia de BBDD India - PADOR (bueno).xlsx").
-    'particion' es una de las claves de particionar_por_accion (buenos/revisar/eliminar).
+    'particion' es una de las claves de particionar_por_accion (buenos/eliminar).
     Reutilizada tanto por guardar_resultados() (CLI) como por streamlit_app.py,
     para que el nombre de descarga coincida con el de la carpeta local.
     """
@@ -1191,12 +1293,11 @@ def nombre_archivo_salida(nombre_original: str, particion: str) -> str:
 
 def guardar_resultados(df_resultado: pd.DataFrame, carpeta_salida: str, nombre_original: str):
     """
-    Guarda tres archivos, nombrados a partir de 'nombre_original' (ver
+    Guarda dos archivos, nombrados a partir de 'nombre_original' (ver
     nombre_archivo_salida):
-        - "<nombre_original> (bueno).xlsx"    -> accion == "MANTENER" (listo para campañas)
-        - "<nombre_original> (revisar).xlsx"  -> accion == "REVISAR" (revisión manual)
-        - "<nombre_original> (malo).xlsx"     -> accion == "ELIMINAR" (descarte, ya validado)
-    Los 3 con todas las columnas originales + status/reason/accion, AutoFiltro
+        - "<nombre_original> (bueno).xlsx"  -> accion == "MANTENER" (listo para campañas)
+        - "<nombre_original> (malo).xlsx"   -> accion == "ELIMINAR" (descarte, ya validado)
+    Los 2 con todas las columnas originales + status/reason/accion, AutoFiltro
     en los encabezados y esa fila congelada (ver _guardar_hoja_excel).
     """
     carpeta = Path(carpeta_salida)
@@ -1305,7 +1406,7 @@ def main():
     parser.add_argument("--columna", default=None,
                          help="Nombre de la columna con los emails (si no se indica, se detecta automáticamente)")
     parser.add_argument("--salida", default="./resultados_limpieza",
-                         help="Carpeta donde guardar 'buenos.xlsx', 'revisar.xlsx' y 'eliminar.xlsx' "
+                         help="Carpeta donde guardar los archivos '(bueno).xlsx' y '(malo).xlsx' "
                               "(por defecto ./resultados_limpieza)")
     parser.add_argument("--guardar-estandarizado", default=None,
                          help="Si se pasa una ruta, guarda ahí una copia del archivo de entrada ya "
@@ -1324,7 +1425,8 @@ def main():
                               f"(hotmail, outlook, live, aol, yahoo...) (por defecto {SMTP_TIMEOUT_PROVEEDOR_MASIVO_DEFAULT})")
     parser.add_argument("--sin-smtp", action="store_true",
                          help="Desactiva la verificación SMTP (útil si tu red bloquea el puerto 25). "
-                              "Todo lo que pase el filtro de sintaxis/desechables/DNS quedará en Unknown/REVISAR.")
+                              "Todo lo que pase el filtro de sintaxis/desechables/DNS quedará en "
+                              "Unknown/MANTENER (reason 'unsupported', sin evidencia real -- ver ACTUALIZACIÓN 6).")
     parser.add_argument("--verificacion-paciente", action="store_true",
                          help="Duplica las pausas progresivas usadas entre reintentos con proveedores "
                               "masivos, para maximizar la tasa de verificación real a costa de que "
@@ -1362,7 +1464,7 @@ def main():
 
     if args.sin_smtp:
         print("[AVISO] Verificación SMTP DESACTIVADA. Los correos con sintaxis y "
-              "dominio válidos quedarán como Unknown/REVISAR.")
+              "dominio válidos quedarán como Unknown/MANTENER (sin evidencia real, ver ACTUALIZACIÓN 6).")
 
     if args.verificacion_paciente:
         print("[INFO] Modo --verificacion-paciente activado: pausas dobles con proveedores "
@@ -1394,7 +1496,7 @@ def main():
     print("RESUMEN")
     print("=" * 70)
     resumen = df_resultado["accion"].value_counts()
-    for accion in ["MANTENER", "ELIMINAR", "REVISAR"]:
+    for accion in ["MANTENER", "ELIMINAR"]:
         print(f"  {accion:10s}: {resumen.get(accion, 0)}")
     print(f"  TOTAL     : {len(df_resultado)}")
 
@@ -1422,53 +1524,59 @@ def main():
 
     # Rechazos 5xx que en realidad son bloqueo de reputación de NUESTRA IP
     # (Spamhaus/PBL/RBL), no una confirmación real de "buzón inexistente".
-    # Desde ACTUALIZACIÓN 5, si el dominio es un proveedor masivo esto va a
-    # MANTENER (mismo bloqueo de reputación ya confirmado); en dominios NO
-    # masivos sigue yendo a REVISAR.
-    es_reputacion_mask = df_resultado["reason"] == "rechazo_por_reputacion_ip_propia"
-    bloqueados_reputacion = int(es_reputacion_mask.sum())
+    # Desde ACTUALIZACIÓN 6, este reason siempre termina en MANTENER (si el
+    # dominio resulta ser catch-all al probarlo, se reclasifica como
+    # "dominio_catch_all" en vez de quedarse con este reason).
+    bloqueados_reputacion = int((df_resultado["reason"] == "rechazo_por_reputacion_ip_propia").sum())
     if bloqueados_reputacion > 0:
-        reputacion_mantener = int((es_reputacion_mask & (df_resultado["accion"] == "MANTENER")).sum())
-        reputacion_revisar = bloqueados_reputacion - reputacion_mantener
-        print(f"\nRechazos 5xx por reputación de nuestra IP (no del buzón): {bloqueados_reputacion} "
-              f"({reputacion_mantener} proveedor masivo -> MANTENER, "
-              f"{reputacion_revisar} dominio propio -> REVISAR)")
+        print(f"\nRechazos 5xx por reputación de nuestra IP (no del buzón), confirmado que el "
+              f"dominio NO es catch-all -> MANTENER: {bloqueados_reputacion}")
 
-    # Dominios catch-all: el 250 a la dirección real no confirmó nada porque
-    # el servidor acepta cualquier dirección (ver DetectorCatchAll). Desde
-    # ACTUALIZACIÓN 4, si el dominio es un proveedor masivo esto va a
-    # MANTENER (aceptan cualquier RCPT TO por diseño); si es un tenant
-    # corporativo mal configurado, sigue yendo a REVISAR.
+    # Dominios catch-all: el 250/5xx/no-concluyente de la dirección real no
+    # confirmó nada porque el servidor acepta cualquier dirección (ver
+    # DetectorCatchAll). Si es un proveedor masivo, MANTENER (ACTUALIZACIÓN
+    # 4); si no, ELIMINAR (ACTUALIZACIÓN 6 -- 0-25% deliverable medido en
+    # 4 de 5 listas reales).
     es_catch_all_mask = df_resultado["reason"] == "dominio_catch_all"
     catch_all_detectados = int(es_catch_all_mask.sum())
     if catch_all_detectados > 0:
         catch_all_mantener = int((es_catch_all_mask & (df_resultado["accion"] == "MANTENER")).sum())
-        catch_all_revisar = catch_all_detectados - catch_all_mantener
+        catch_all_eliminar = catch_all_detectados - catch_all_mantener
         print(f"\nDominios catch-all detectados: {catch_all_detectados} "
               f"({catch_all_mantener} proveedor masivo -> MANTENER, "
-              f"{catch_all_revisar} tenant corporativo -> REVISAR)")
+              f"{catch_all_eliminar} dominio propio -> ELIMINAR)")
 
+    # Buckets sin evidencia de deliverabilidad real, mandados a MANTENER por
+    # decisión de política (ACTUALIZACIÓN 6), no por un dato medido. Se
+    # imprimen igual para poder notar un salto raro en estos números, ya
+    # que no hay revisión manual que los filtre.
     catch_all_no_verificable = int((df_resultado["reason"] == "catchall_no_verificable").sum())
     if catch_all_no_verificable > 0:
-        print(f"No se pudo determinar si el dominio es catch-all (enviados a REVISAR): "
+        print(f"No se pudo determinar si el dominio es catch-all (sin evidencia -> MANTENER): "
               f"{catch_all_no_verificable}")
+
+    dns_error_count = int((df_resultado["reason"] == "dns_error").sum())
+    if dns_error_count > 0:
+        print(f"Error de DNS tras reintentos (sin evidencia -> MANTENER): {dns_error_count}")
+
+    unsupported_count = int((df_resultado["reason"] == "unsupported").sum())
+    if unsupported_count > 0:
+        print(f"Verificación SMTP desactivada (sin evidencia -> MANTENER): {unsupported_count}")
 
     print("\nArchivos generados:")
     print(f"  - {rutas['buenos']}    (accion = MANTENER, listo para campañas)")
-    print(f"  - {rutas['revisar']}   (accion = REVISAR, revisión manual)")
     print(f"  - {rutas['eliminar']}  (accion = ELIMINAR, descarte)")
 
-    print("\nListo. Los 3 archivos tienen AutoFiltro y encabezado congelado. "
-          "'buenos.xlsx' contiene reason == 'accepted_email' (confirmación SMTP real de dominios "
-          "NO catch-all), y también 'smtp_bloqueado_proveedor_masivo', 'dominio_catch_all' y "
-          "'rechazo_por_reputacion_ip_propia' cuando el dominio es un proveedor masivo (hotmail/"
-          "outlook/live/aol/yahoo, o dominio propio hosteado en M365) -- ninguno de estos 4 tiene "
-          "confirmación SMTP directa, pero verificados deliverable en su mayoría contra Bouncer "
-          "en varias listas reales. Dentro de 'revisar.xlsx', filtrá la columna 'reason' para ver "
-          "'rechazo_por_reputacion_ip_propia' y 'dominio_catch_all' de un dominio NO masivo (mala "
-          "configuración o mail server chico, el 250/5xx no confirma nada) o "
-          "'catchall_no_verificable' (no se pudo determinar) — ninguno de estos es una "
-          "confirmación real, por eso van a revisión manual en vez de a la campaña directa.")
+    print("\nListo. Los 2 archivos tienen AutoFiltro y encabezado congelado. Ya no existe "
+          "'revisar.xlsx' (ACTUALIZACIÓN 6): la organización decidió priorizar no perder "
+          "contactos por sobre el riesgo de algún rebote ocasional, así que todo se reparte "
+          "entre 'bueno.xlsx' y 'malo.xlsx'. Filtrá la columna 'reason' en 'bueno.xlsx' para "
+          "ver qué tan directa fue cada confirmación: 'accepted_email' es la única confirmación "
+          "SMTP 100% real; el resto ('smtp_bloqueado_proveedor_masivo', 'dominio_catch_all', "
+          "'rechazo_por_reputacion_ip_propia', 'dns_error', 'unsupported', 'catchall_no_verificable', "
+          "'unavailable_smtp', 'timeout', 'unknown') son inferencias con distinto nivel de "
+          "evidencia detrás -- ver el docstring de clasificar_email (ACTUALIZACIÓN 6) para el "
+          "detalle de cada una.")
 
 
 if __name__ == "__main__":
