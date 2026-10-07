@@ -23,11 +23,12 @@ SMTP" de acá abajo si necesitás igual filtrar por sintaxis/dominio/desechables
 """
 
 import threading
+import time
 import urllib.request
+import uuid
 
 import dns.resolver
 import streamlit as st
-from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
 from limpiador_correos_fase1 import (
     CONCURRENCIA_DEFAULT,
@@ -123,20 +124,78 @@ with st.expander("Opciones avanzadas"):
         except Exception as e:
             st.warning(f"No se pudo leer el archivo todavía para elegir columna: {e}")
 
-# --------------------------------------------------------------------------
-# Estado persistente entre reruns (necesario porque la verificación corre en
-# un hilo de fondo y el progreso se muestra vía un fragment que se refresca
-# solo, de forma independiente al resto del script -- ver más abajo).
-# --------------------------------------------------------------------------
-if "hilo_clasificacion" not in st.session_state:
-    st.session_state.hilo_clasificacion = None
-    st.session_state.progreso_completados = 0
-    st.session_state.progreso_total = 0
-    st.session_state.resultado_final = None
-    st.session_state.error_final = None
-    st.session_state.nombre_archivo_original = None
 
-hay_verificacion_en_curso = st.session_state.hilo_clasificacion is not None
+# --------------------------------------------------------------------------
+# Verificaciones guardadas en el SERVIDOR, no en la sesión del navegador.
+#
+# Antes todo el estado (hilo, progreso, resultado) vivía en st.session_state,
+# que es por sesión de navegador: si la pestaña perdía la conexión durante
+# una corrida larga (portátil suspendido, cambio de red, pestaña mucho rato
+# en segundo plano), Streamlit abría una sesión NUEVA y la app "volvía a
+# inicio" sin ningún error, mientras la verificación seguía corriendo en el
+# servidor sin que nadie pudiera ver el resultado (caso real: BBDD
+# Emprendedores Español, ~7.000 correos, octubre 2026).
+#
+# Ahora cada verificación es un TrabajoVerificacion guardado en un registro
+# del proceso (st.cache_resource, compartido entre sesiones), identificado
+# por un id que también va en la URL (?trabajo=...). Al reconectar o
+# recargar la página, la sesión nueva lee ese id de la URL y retoma el mismo
+# trabajo: progreso en vivo o resultados listos para descargar.
+# Límite conocido: un reinicio del servidor (ej. cada redeploy tras un push)
+# sí borra el registro y corta las verificaciones en curso.
+# --------------------------------------------------------------------------
+HORAS_RETENCION_TRABAJOS = 24
+
+
+class TrabajoVerificacion:
+    def __init__(self, nombre_archivo_original: str, columna_email: str, total: int):
+        self.nombre_archivo_original = nombre_archivo_original
+        self.columna_email = columna_email
+        self.creado_en = time.time()
+        self.completados = 0
+        self.total = total
+        self.resultado = None  # (df_resultado, tiempo_total_segundos)
+        self.error = None
+        self.hilo = None
+        self._excels = {}
+        self._lock_excels = threading.Lock()
+
+    def en_curso(self) -> bool:
+        return self.hilo is not None and self.hilo.is_alive()
+
+    def excel(self, particiones: dict, clave: str) -> bytes:
+        # Se genera una sola vez por archivo: los reruns de Streamlit (y las
+        # reconexiones) no vuelven a armar el .xlsx de miles de filas.
+        with self._lock_excels:
+            if clave not in self._excels:
+                self._excels[clave] = generar_excel_en_memoria(particiones[clave])
+            return self._excels[clave]
+
+
+@st.cache_resource
+def _registro_trabajos() -> dict:
+    return {}
+
+
+def _limpiar_trabajos_viejos(registro: dict):
+    limite = time.time() - HORAS_RETENCION_TRABAJOS * 3600
+    for id_trabajo, trabajo in list(registro.items()):
+        if trabajo.creado_en < limite and not trabajo.en_curso():
+            registro.pop(id_trabajo, None)
+
+
+registro_trabajos = _registro_trabajos()
+id_trabajo_actual = st.query_params.get("trabajo")
+trabajo_actual = registro_trabajos.get(id_trabajo_actual) if id_trabajo_actual else None
+
+if id_trabajo_actual and trabajo_actual is None:
+    st.warning(
+        "No se encontró la verificación de este enlace. Puede que el servidor se "
+        "haya reiniciado (por ejemplo, tras una actualización de la app) o que "
+        f"tenga más de {HORAS_RETENCION_TRABAJOS} h. Vuelve a subir el archivo."
+    )
+
+hay_verificacion_en_curso = trabajo_actual is not None and trabajo_actual.en_curso()
 
 correr = st.button(
     "Verificar correos",
@@ -152,35 +211,22 @@ if correr and archivo_subido is not None:
                 archivo_subido, columna_seleccionada, archivo_subido.name
             )
 
-        st.info(f"Columna de email usada: **{columna_email}** — {len(df_entrada)} correo(s) a verificar.")
-
         lista_negra_local = cargar_o_crear_lista_negra_local(RUTA_LISTA_NEGRA_LOCAL)
 
-        st.session_state.progreso_completados = 0
-        st.session_state.progreso_total = len(df_entrada)
-        st.session_state.resultado_final = None
-        st.session_state.error_final = None
-        st.session_state.nombre_archivo_original = archivo_subido.name
+        _limpiar_trabajos_viejos(registro_trabajos)
+        trabajo = TrabajoVerificacion(archivo_subido.name, columna_email, len(df_entrada))
 
-        # Streamlit solo resuelve st.session_state al "contexto real" de esta
-        # sesion (ScriptRunContext) en el hilo que Streamlit maneja para esta
-        # corrida. Un threading.Thread nuevo NO hereda ese contexto solo: sin
-        # add_script_run_ctx, cualquier escritura a st.session_state hecha
-        # desde ese hilo (o desde los hilos del ThreadPoolExecutor dentro de
-        # clasificar_dataframe) queda aislada en un estado "mock" interno de
-        # Streamlit y nunca llega a esta sesion real -- por eso el contador
-        # de progreso quedaba pegado en 0. Capturamos el contexto actual aca
-        # (hilo principal, con contexto real) para propagarlo explicitamente.
-        ctx_streamlit = get_script_run_ctx()
-
+        # Los hilos de verificación solo escriben en el objeto 'trabajo' (no
+        # en st.session_state), así que no necesitan el contexto de Streamlit
+        # de ninguna sesión: siguen funcionando aunque el navegador se
+        # desconecte.
         def _actualizar_progreso(completados, total):
-            add_script_run_ctx(ctx=ctx_streamlit)
-            st.session_state.progreso_completados = completados
-            st.session_state.progreso_total = total
+            trabajo.completados = completados
+            trabajo.total = total
 
         def _correr_clasificacion():
             try:
-                st.session_state.resultado_final = clasificar_dataframe(
+                trabajo.resultado = clasificar_dataframe(
                     df_entrada, columna_email, lista_negra_local,
                     dns_timeout=DNS_TIMEOUT_DEFAULT,
                     smtp_timeout=SMTP_TIMEOUT_DEFAULT,
@@ -193,15 +239,15 @@ if correr and archivo_subido is not None:
                     callback_progreso=_actualizar_progreso,
                 )
             except Exception as e:
-                st.session_state.error_final = e
+                trabajo.error = e
 
-        hilo = threading.Thread(target=_correr_clasificacion, daemon=True)
-        add_script_run_ctx(hilo, ctx=ctx_streamlit)
-        st.session_state.hilo_clasificacion = hilo
-        hilo.start()
-        # Fuerza un rerun inmediato para entrar en el bloque de progreso de
-        # abajo ya en este mismo instante (en vez de esperar a la próxima
-        # interacción del usuario).
+        trabajo.hilo = threading.Thread(target=_correr_clasificacion, daemon=True)
+        id_nuevo = uuid.uuid4().hex
+        registro_trabajos[id_nuevo] = trabajo
+        trabajo.hilo.start()
+
+        st.query_params["trabajo"] = id_nuevo
+        # Rerun inmediato para entrar ya en el panel de progreso de abajo.
         st.rerun()
 
     except ValueError as e:
@@ -211,49 +257,45 @@ if correr and archivo_subido is not None:
 
 
 # --------------------------------------------------------------------------
-# Panel de progreso: usa st.fragment(run_every=...), el mecanismo nativo de
-# Streamlit para refrescar SOLO este bloque cada ~2s sin volver a correr todo
-# el script y sin que los hilos de verificación toquen la UI directamente
-# (los hilos solo escriben en st.session_state vía callback_progreso; quien
-# lee ese estado y actualiza la pantalla es siempre este fragment, corriendo
-# en el hilo principal de Streamlit). Esto reemplaza el sondeo anterior con
-# un "while + time.sleep()" bloqueante, que no refrescaba la pantalla en vivo.
+# Panel de progreso: st.fragment(run_every=...) refresca SOLO este bloque
+# cada ~2s leyendo el objeto del trabajo; cuando el hilo termina, fuerza un
+# rerun completo para mostrar el resumen y las descargas.
 # --------------------------------------------------------------------------
-if st.session_state.hilo_clasificacion is not None:
+if trabajo_actual is not None and trabajo_actual.en_curso():
+    st.info(
+        f"Verificando **{trabajo_actual.nombre_archivo_original}** (columna de email: "
+        f"**{trabajo_actual.columna_email}**). Puedes recargar "
+        "la página o volver más tarde con este mismo enlace (la dirección de esta "
+        "pestaña): la verificación sigue en el servidor aunque se corte la conexión."
+    )
 
     @st.fragment(run_every="2s")
     def _panel_progreso():
-        hilo = st.session_state.hilo_clasificacion
-        if hilo is None:
-            return
-
-        completados = st.session_state.progreso_completados
-        total = st.session_state.progreso_total
-
-        if hilo.is_alive():
+        completados = trabajo_actual.completados
+        total = trabajo_actual.total
+        if trabajo_actual.en_curso():
             st.text(f"Verificando... {completados} de {total} correos verificados (aproximado).")
             if total:
                 st.progress(min(completados / total, 1.0))
         else:
-            # El hilo de fondo ya terminó: liberamos el estado de "en curso"
-            # y forzamos un rerun completo para mostrar el resumen y las
-            # descargas más abajo.
-            st.session_state.hilo_clasificacion = None
             st.rerun()
 
     _panel_progreso()
 
 
 # --------------------------------------------------------------------------
-# Resultado final: se muestra apenas hay un resultado (o error) guardado.
+# Resultado final: se muestra apenas el trabajo tiene un resultado (o error).
 # --------------------------------------------------------------------------
-if st.session_state.error_final is not None:
-    st.error(f"Ocurrió un error inesperado durante la verificación: {st.session_state.error_final}")
+elif trabajo_actual is not None and trabajo_actual.error is not None:
+    st.error(f"Ocurrió un error inesperado durante la verificación: {trabajo_actual.error}")
 
-elif st.session_state.resultado_final is not None:
-    df_resultado, tiempo_total_segundos = st.session_state.resultado_final
+elif trabajo_actual is not None and trabajo_actual.resultado is not None:
+    df_resultado, tiempo_total_segundos = trabajo_actual.resultado
     minutos, segundos = divmod(tiempo_total_segundos, 60)
-    st.success(f"Listo en {int(minutos)} min {segundos:.0f} s.")
+    st.success(
+        f"**{trabajo_actual.nombre_archivo_original}**: listo en "
+        f"{int(minutos)} min {segundos:.0f} s."
+    )
 
     particiones = particionar_por_accion(df_resultado)
     total = len(df_resultado)
@@ -267,13 +309,8 @@ elif st.session_state.resultado_final is not None:
     col3.metric("ELIMINAR", len(particiones["eliminar"]), _pct(len(particiones["eliminar"])))
 
     st.subheader("Descargar resultados")
-    # .get() con fallback en vez de acceso directo: sesiones viejas que
-    # quedaron abiertas durante un redeploy pueden no tener esta clave
-    # (agregada en una version posterior del codigo) y el acceso por punto
-    # tira AttributeError en vez de None.
-    nombre_original = st.session_state.get("nombre_archivo_original") or "resultado"
     nombres_archivo = {
-        clave: nombre_archivo_salida(nombre_original, clave)
+        clave: nombre_archivo_salida(trabajo_actual.nombre_archivo_original, clave)
         for clave in ("buenos", "eliminar")
     }
     etiquetas_accion = {"buenos": "MANTENER", "eliminar": "ELIMINAR"}
@@ -281,7 +318,7 @@ elif st.session_state.resultado_final is not None:
     for columna_ui, clave in zip((col_a, col_b), ("buenos", "eliminar")):
         columna_ui.download_button(
             f"⬇️ Descargar {nombres_archivo[clave]} ({etiquetas_accion[clave]})",
-            data=generar_excel_en_memoria(particiones[clave]),
+            data=trabajo_actual.excel(particiones, clave),
             file_name=nombres_archivo[clave],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
