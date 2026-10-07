@@ -761,7 +761,8 @@ def clasificar_email(email_original: str, lista_negra_local: set,
     Aplica el pipeline completo y devuelve un dict con:
         email, status, reason, accion
     """
-    email_original = str(email_original).strip()
+    email_original = CARACTERES_INVISIBLES_EMAIL_RE.sub(
+        "", CARACTERES_ILEGALES_EXCEL_RE.sub("", str(email_original))).strip()
 
     # 1) Sintaxis
     valido, email_normalizado, dominio = validar_sintaxis(email_original)
@@ -1034,6 +1035,25 @@ def detectar_columna_email(columnas):
     return None
 
 
+def detectar_columna_email_por_contenido(df: pd.DataFrame, umbral: float = 0.5):
+    """
+    Último recurso cuando ningún encabezado delata la columna de email (ej.
+    "Adresse électronique", "Courriel" u otros idiomas): elige la columna en
+    la que más celdas no vacías contienen "@", siempre que superen 'umbral'.
+    Devuelve el nombre de columna, o None si ninguna lo supera.
+    """
+    mejor_columna, mejor_proporcion = None, umbral
+    for columna in df.columns:
+        valores = df[columna].dropna().astype(str).str.strip()
+        valores = valores[valores != ""]
+        if valores.empty:
+            continue
+        proporcion = valores.str.contains("@", regex=False).mean()
+        if proporcion > mejor_proporcion:
+            mejor_columna, mejor_proporcion = columna, proporcion
+    return mejor_columna
+
+
 def expandir_emails_multiples(df: pd.DataFrame, columna_email: str) -> pd.DataFrame:
     """
     Divide las celdas de la columna de email que contengan varias direcciones
@@ -1147,6 +1167,43 @@ def _detectar_separador_csv(texto: str) -> str:
         return ";" if primera_linea.count(";") > primera_linea.count(",") else ","
 
 
+# Caracteres de control ASCII que Excel/openpyxl NO admiten en una celda
+# (todos los de 0x00-0x1F salvo tabulación, salto de línea y retorno de
+# carro). Suelen colarse al copiar/pegar desde webs o PDF, o en exportaciones
+# de CRMs. Si llegan a una celda, openpyxl tira IllegalCharacterError al
+# generar el .xlsx y se pierde toda la corrida (caso real: BBDD Emprendedores
+# Francés, 7.062 registros, falló al descargar tras 26 min de verificación).
+CARACTERES_ILEGALES_EXCEL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+# Caracteres invisibles de ancho cero (zero-width space/joiner, word joiner,
+# BOM) que Excel sí admite, pero que pegados a un correo lo vuelven inválido
+# en la verificación de sintaxis sin que se vea nada raro en la celda.
+CARACTERES_INVISIBLES_EMAIL_RE = re.compile(r"[​-‍⁠﻿]")
+
+
+def _limpiar_texto_celda(valor):
+    if isinstance(valor, str):
+        return CARACTERES_ILEGALES_EXCEL_RE.sub("", valor)
+    return valor
+
+
+def limpiar_caracteres_ilegales(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve una copia de 'df' sin caracteres de control ilegales para Excel,
+    tanto en los encabezados como en todas las celdas de texto. Las celdas no
+    texto (números, fechas, NaN) quedan tal cual.
+    """
+    df = df.copy()
+    df.columns = [_limpiar_texto_celda(c) for c in df.columns]
+    # pandas 3 guarda el texto como dtype "str" en vez de "object": se
+    # cubren ambos (las columnas object pueden mezclar texto y números).
+    for columna in df.columns:
+        serie = df[columna]
+        if pd.api.types.is_object_dtype(serie) or pd.api.types.is_string_dtype(serie):
+            df[columna] = serie.map(_limpiar_texto_celda)
+    return df
+
+
 def estandarizar_entrada(fuente, nombre_archivo: str = None) -> pd.DataFrame:
     """
     Lee 'fuente' (ruta en disco, o bytes/objeto tipo archivo como el
@@ -1158,7 +1215,7 @@ def estandarizar_entrada(fuente, nombre_archivo: str = None) -> pd.DataFrame:
     extension = _detectar_extension(fuente, nombre_archivo)
 
     if extension in (".xlsx", ".xls"):
-        return pd.read_excel(fuente)
+        return limpiar_caracteres_ilegales(pd.read_excel(fuente))
 
     if extension != ".csv":
         raise ValueError(f"Formato no soportado: {extension}. Usa .csv, .xlsx o .xls")
@@ -1167,7 +1224,7 @@ def estandarizar_entrada(fuente, nombre_archivo: str = None) -> pd.DataFrame:
     encoding_usado, texto = _detectar_encoding_y_texto(datos)
     separador_usado = _detectar_separador_csv(texto)
 
-    return pd.read_csv(io.StringIO(texto), sep=separador_usado)
+    return limpiar_caracteres_ilegales(pd.read_csv(io.StringIO(texto), sep=separador_usado))
 
 
 def leer_lista_contactos(ruta_entrada, columna_email: str = None, nombre_archivo: str = None):
@@ -1175,6 +1232,8 @@ def leer_lista_contactos(ruta_entrada, columna_email: str = None, nombre_archivo
 
     if columna_email is None:
         columna_email = detectar_columna_email(df.columns)
+        if columna_email is None:
+            columna_email = detectar_columna_email_por_contenido(df)
         if columna_email is None:
             raise ValueError(
                 "No se pudo detectar automáticamente la columna de email. "
@@ -1236,6 +1295,10 @@ def _guardar_hoja_excel(df: pd.DataFrame, destino, sheet_name: str = "Resultado"
     scroll. 'destino' puede ser una ruta en disco (Path/str) o un buffer en
     memoria (io.BytesIO) -- pd.ExcelWriter acepta ambos por igual.
     """
+    # Red de seguridad: aunque la entrada ya se limpia al leerla, columnas
+    # generadas durante la verificación (ej. respuestas de servidores SMTP)
+    # también podrían traer caracteres de control.
+    df = limpiar_caracteres_ilegales(df)
     with pd.ExcelWriter(destino, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name=sheet_name)
         worksheet = writer.sheets[sheet_name]
